@@ -18,6 +18,7 @@ using sllmrf::Internlm2Model;
 using sllmrf::MetadataValueType;
 using sllmrf::TensorBuffer;
 using sllmrf::Tokenizer;
+using sllmrf::Device;
 
 struct TensorSpec {
     std::string name;
@@ -293,6 +294,89 @@ void run_fixture_test() {
     const auto rms_output = sllmrf::ops::rms_norm(rms_input, {1.0F, 1.0F}, 1.0e-5F);
     expect_near(rms_output.at(0, 0), 0.848527F, 1.0e-4F, "rms_norm first value mismatch");
     expect_near(rms_output.at(0, 1), 1.131370F, 1.0e-4F, "rms_norm second value mismatch");
+    const auto rms_weight_tensor = model.weights().require_tensor(model.layout().output_norm);
+    const auto rms_output_from_tensor = sllmrf::ops::rms_norm(rms_input, rms_weight_tensor, 1.0e-5F);
+    expect_near(rms_output_from_tensor.at(0, 0), 0.848527F, 1.0e-4F, "tensor rms_norm first value mismatch");
+    expect_near(rms_output_from_tensor.at(0, 1), 1.131370F, 1.0e-4F, "tensor rms_norm second value mismatch");
+    expect(rms_output.device() == Device::cpu(), "rms_norm output device mismatch");
+    const auto cuda_backend_is_native = sllmrf::cuda_backend_enabled();
+    expect(
+        sllmrf::describe_device_backend(Device::cuda(0)) ==
+            (cuda_backend_is_native ? "native cuda backend" : "emulated cuda staging backend"),
+        "cuda backend description mismatch");
+
+    const TensorBuffer cpu_lhs({1U, 2U}, {1.0F, 2.0F}, Device::cpu());
+    const TensorBuffer cpu_rhs({1U, 2U}, {3.0F, 4.0F}, Device::cpu());
+    const auto cpu_sum = sllmrf::ops::add(cpu_lhs, cpu_rhs, sllmrf::ops::OperatorContext::cpu());
+    expect(cpu_sum.device() == Device::cpu(), "cpu add device mismatch");
+    expect_near(cpu_sum.at(0, 0), 4.0F, 1.0e-6F, "cpu add first value mismatch");
+    expect_near(cpu_sum.at(0, 1), 6.0F, 1.0e-6F, "cpu add second value mismatch");
+
+    bool rejected_cuda_context_mismatch = false;
+    try {
+        const auto unused = sllmrf::ops::add(
+            cpu_lhs,
+            cpu_rhs,
+            sllmrf::ops::OperatorContext::cuda(0));
+        (void)unused;
+    } catch (const sllmrf::GgufError &) {
+        rejected_cuda_context_mismatch = true;
+    }
+    expect(rejected_cuda_context_mismatch, "cpu tensors with cuda execution context should be rejected");
+
+    auto pseudo_cuda_tensor = cpu_lhs.copy_to(Device::cuda(0));
+    expect(pseudo_cuda_tensor.device() == Device::cuda(0), "cuda tensor placement mismatch");
+    expect(pseudo_cuda_tensor.has_device_allocation(), "cuda tensor missing device allocation");
+    expect(
+        pseudo_cuda_tensor.is_device_allocation_emulated() == !cuda_backend_is_native,
+        "cuda tensor allocation mode mismatch");
+    expect(pseudo_cuda_tensor.device_data() != nullptr, "cuda tensor device pointer mismatch");
+    expect(!pseudo_cuda_tensor.host_dirty(), "fresh cuda tensor host state mismatch");
+    expect(!pseudo_cuda_tensor.device_dirty(), "fresh cuda tensor device state mismatch");
+    auto roundtrip_cpu_tensor = pseudo_cuda_tensor.copy_to(Device::cpu());
+    expect(roundtrip_cpu_tensor.device() == Device::cpu(), "roundtrip cpu tensor placement mismatch");
+    expect_near(roundtrip_cpu_tensor.at(0, 0), 1.0F, 1.0e-6F, "roundtrip cpu tensor first value mismatch");
+    expect_near(roundtrip_cpu_tensor.at(0, 1), 2.0F, 1.0e-6F, "roundtrip cpu tensor second value mismatch");
+    pseudo_cuda_tensor.values()[0] = 9.0F;
+    expect(pseudo_cuda_tensor.host_dirty(), "cuda tensor host dirty flag should be set after host write");
+    pseudo_cuda_tensor.sync_host_to_device();
+    expect(!pseudo_cuda_tensor.host_dirty(), "cuda tensor host dirty flag should clear after upload");
+
+    auto pseudo_cuda_rhs = cpu_rhs.copy_to(Device::cuda(0));
+    const auto cuda_sum = sllmrf::ops::add(
+        pseudo_cuda_tensor,
+        pseudo_cuda_rhs,
+        sllmrf::ops::OperatorContext::cuda(0));
+    expect(cuda_sum.device() == Device::cuda(0), "cuda add output placement mismatch");
+    auto cuda_sum_cpu = cuda_sum.copy_to(Device::cpu());
+    expect_near(cuda_sum_cpu.at(0, 0), 12.0F, 1.0e-6F, "cuda add first value mismatch");
+    expect_near(cuda_sum_cpu.at(0, 1), 6.0F, 1.0e-6F, "cuda add second value mismatch");
+
+    const auto cuda_silu = sllmrf::ops::silu(
+        pseudo_cuda_tensor,
+        sllmrf::ops::OperatorContext::cuda(0));
+    expect(cuda_silu.device() == Device::cuda(0), "cuda silu output placement mismatch");
+    auto cuda_silu_cpu = cuda_silu.copy_to(Device::cpu());
+    expect_near(cuda_silu_cpu.at(0, 0), 8.998890F, 1.0e-4F, "cuda silu first value mismatch");
+    expect_near(cuda_silu_cpu.at(0, 1), 1.761594F, 1.0e-4F, "cuda silu second value mismatch");
+
+    auto cuda_inplace = pseudo_cuda_tensor.copy_to(Device::cuda(0));
+    sllmrf::ops::add_inplace(
+        cuda_inplace,
+        pseudo_cuda_rhs,
+        sllmrf::ops::OperatorContext::cuda(0));
+    auto cuda_inplace_cpu = cuda_inplace.copy_to(Device::cpu());
+    expect_near(cuda_inplace_cpu.at(0, 0), 12.0F, 1.0e-6F, "cuda add_inplace first value mismatch");
+    expect_near(cuda_inplace_cpu.at(0, 1), 6.0F, 1.0e-6F, "cuda add_inplace second value mismatch");
+
+    bool rejected_device_mismatch = false;
+    try {
+        const auto unused = sllmrf::ops::silu(pseudo_cuda_tensor);
+        (void)unused;
+    } catch (const sllmrf::GgufError &) {
+        rejected_device_mismatch = true;
+    }
+    expect(rejected_device_mismatch, "cuda tensor should be rejected by cpu backend");
 
     const auto normalized = model.apply_final_norm(embedding);
     expect(normalized.shape() == embedding.shape(), "final norm shape mismatch");
@@ -340,6 +424,33 @@ void run_fixture_test() {
         expect_near(full_hidden.values()[index], block_output.values()[index], 1.0e-5F, "full rollout mismatch");
     }
 
+    auto cuda_runtime = model.create_runtime(0U, sllmrf::ops::OperatorContext::cuda(0));
+    const auto cuda_embedding = model.run_prompt_embedding(prompt, cuda_runtime);
+    expect(cuda_embedding.device() == Device::cuda(0), "cuda embedding placement mismatch");
+    auto cuda_embedding_cpu = cuda_embedding.copy_to(Device::cpu());
+    for (std::size_t index = 0; index < cuda_embedding_cpu.values().size(); ++index) {
+        expect_near(
+            cuda_embedding_cpu.values()[index],
+            embedding.values()[index],
+            1.0e-6F,
+            "cuda embedding mismatch");
+    }
+    const auto cuda_block_output = model.forward_layer(cuda_embedding, 0U, cuda_runtime);
+    expect(cuda_block_output.device() == Device::cuda(0), "cuda block output placement mismatch");
+    auto cuda_block_output_cpu = cuda_block_output.copy_to(Device::cpu());
+    for (std::size_t index = 0; index < cuda_block_output_cpu.values().size(); ++index) {
+        expect_near(
+            cuda_block_output_cpu.values()[index],
+            block_output.values()[index],
+            1.0e-5F,
+            "cuda block output mismatch");
+    }
+    const auto cuda_block_logits = model.compute_logits(cuda_block_output);
+    expect(cuda_block_logits.size() == block_logits.size(), "cuda block logits size mismatch");
+    for (std::size_t index = 0; index < cuda_block_logits.size(); ++index) {
+        expect_near(cuda_block_logits[index], block_logits[index], 1.0e-5F, "cuda block logits mismatch");
+    }
+
     const auto generated = model.generate(
         "hello world!",
         sllmrf::GenerationConfig {
@@ -362,6 +473,7 @@ void run_fixture_test() {
             .add_bos = true,
             .stop_at_eos = true,
             .layer_count = 0U,
+            .execution_context = sllmrf::ops::OperatorContext::cpu(),
             .sampling_strategy = sllmrf::SamplingStrategy::Stochastic,
             .temperature = 1.0F,
             .seed = 7U,
@@ -374,6 +486,7 @@ void run_fixture_test() {
             .add_bos = true,
             .stop_at_eos = true,
             .layer_count = 0U,
+            .execution_context = sllmrf::ops::OperatorContext::cpu(),
             .sampling_strategy = sllmrf::SamplingStrategy::Stochastic,
             .temperature = 1.0F,
             .seed = 7U,
@@ -382,6 +495,18 @@ void run_fixture_test() {
     expect(
         stochastic_generated_a.generated_token_ids == stochastic_generated_b.generated_token_ids,
         "fixture seeded stochastic generation should be repeatable");
+
+    const auto cuda_generated = model.generate(
+        "hello world!",
+        sllmrf::GenerationConfig {
+            .max_new_tokens = 3U,
+            .add_bos = true,
+            .stop_at_eos = true,
+            .layer_count = 0U,
+            .execution_context = sllmrf::ops::OperatorContext::cuda(0),
+        });
+    expect(cuda_generated.generated_token_ids == generated.generated_token_ids, "cuda generation token mismatch");
+    expect(cuda_generated.generated_text == generated.generated_text, "cuda generation text mismatch");
 }
 
 void run_optional_model_smoke_test() {
@@ -415,6 +540,7 @@ void run_optional_model_smoke_test() {
             .add_bos = true,
             .stop_at_eos = true,
             .layer_count = 0U,
+            .execution_context = sllmrf::ops::OperatorContext::cpu(),
         });
     expect(generated.generated_token_ids.size() <= 5U, "real model generation size mismatch");
     expect(generated.generated_text == model.tokenizer().decode(generated.generated_token_ids), "real model generation decode mismatch");
@@ -427,6 +553,7 @@ void run_optional_model_smoke_test() {
             .add_bos = true,
             .stop_at_eos = true,
             .layer_count = 0U,
+            .execution_context = sllmrf::ops::OperatorContext::cpu(),
             .sampling_strategy = sllmrf::SamplingStrategy::Stochastic,
             .temperature = 0.8F,
             .seed = 20260406U,
@@ -439,6 +566,7 @@ void run_optional_model_smoke_test() {
             .add_bos = true,
             .stop_at_eos = true,
             .layer_count = 0U,
+            .execution_context = sllmrf::ops::OperatorContext::cpu(),
             .sampling_strategy = sllmrf::SamplingStrategy::Stochastic,
             .temperature = 0.8F,
             .seed = 20260406U,
@@ -451,6 +579,10 @@ void run_optional_model_smoke_test() {
         stochastic_generated_a.generated_text ==
             model.tokenizer().decode(stochastic_generated_a.generated_token_ids),
         "real model stochastic generation decode mismatch");
+
+    auto cuda_runtime = model.create_runtime(64U, sllmrf::ops::OperatorContext::cuda(0));
+    const auto cuda_prompt_hidden = model.forward_prompt(prompt, cuda_runtime);
+    expect(cuda_prompt_hidden.device() == Device::cuda(0), "real model cuda rollout placement mismatch");
 }
 
 }  // namespace

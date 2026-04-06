@@ -14,6 +14,11 @@
 #include <omp.h>
 #endif
 
+#if defined(SLLMRF_USE_CUDA) && SLLMRF_USE_CUDA
+#include "internlm2_cuda.h"
+#include "operators_cuda.h"
+#endif
+
 namespace sllmrf {
 
 namespace {
@@ -142,6 +147,34 @@ uint32_t sample_stochastic_impl(
     return static_cast<uint32_t>(distribution(rng));
 }
 
+ops::OperatorContext context_for_device(Device device) {
+    return ops::OperatorContext {.device = device};
+}
+
+uint32_t resolve_runtime_sequence_length(
+    const Internlm2Config &config,
+    std::size_t prompt_token_count,
+    uint32_t max_new_tokens) {
+    const auto requested = static_cast<uint64_t>(prompt_token_count) + static_cast<uint64_t>(max_new_tokens);
+    const auto bounded = std::min<uint64_t>(
+        config.context_length,
+        std::max<uint64_t>(1U, requested));
+    return static_cast<uint32_t>(bounded);
+}
+
+void require_execution_device(
+    const TensorBuffer &tensor,
+    const Device &device,
+    std::string_view op_name,
+    std::string_view arg_name) {
+    if (tensor.device() != device) {
+        throw GgufError(
+            std::string(op_name) + " requires " + std::string(arg_name) +
+            " on execution device " + device.to_string() + ", but got " +
+            tensor.placement_string());
+    }
+}
+
 float tensor3_get(
     const TensorBuffer &tensor,
     uint64_t token_index,
@@ -187,7 +220,7 @@ float dot_tensor_row(
     throw GgufError("linear projection is not implemented for tensor type " + to_string(type));
 }
 
-TensorBuffer linear_project(
+TensorBuffer linear_project_cpu(
     const GgufTensorReader &weights,
     std::string_view tensor_name,
     const TensorBuffer &input) {
@@ -203,7 +236,7 @@ TensorBuffer linear_project(
     const auto output_width = static_cast<std::size_t>(tensor.row_count());
     const auto bytes_per_row = input_width * ggml_type_size(tensor.type);
 
-    TensorBuffer output({input.rows(), static_cast<uint64_t>(output_width)});
+    TensorBuffer output({input.rows(), static_cast<uint64_t>(output_width)}, 0.0F, input.device());
     #if defined(_OPENMP)
     #pragma omp parallel for collapse(2) schedule(static)
     #endif
@@ -219,7 +252,31 @@ TensorBuffer linear_project(
     return output;
 }
 
-void apply_rope_inplace(
+TensorBuffer linear_project(
+    const GgufTensorReader &weights,
+    std::string_view tensor_name,
+    const TensorBuffer &input,
+    ops::OperatorContext context) {
+    require_execution_device(input, context.device, "linear_project", "input");
+    if (context.device.is_cpu()) {
+        return linear_project_cpu(weights, tensor_name, input);
+    }
+
+    if (context.device.is_cuda()) {
+#if defined(SLLMRF_USE_CUDA) && SLLMRF_USE_CUDA
+        if (cuda_backend_enabled()) {
+            return ops::cuda::linear_project(weights.require_tensor(tensor_name), input);
+        }
+#endif
+        auto cpu_input = input.copy_to(Device::cpu());
+        auto cpu_output = linear_project_cpu(weights, tensor_name, cpu_input);
+        return cpu_output.copy_to(context.device);
+    }
+
+    throw GgufError("linear_project native CUDA backend is not implemented yet");
+}
+
+void apply_rope_inplace_cpu(
     TensorBuffer &q,
     TensorBuffer &k,
     const Internlm2Config &config,
@@ -277,7 +334,38 @@ void apply_rope_inplace(
     rotate(k, config.attention_head_count_kv);
 }
 
-void write_kv_cache(
+void apply_rope_inplace(
+    TensorBuffer &q,
+    TensorBuffer &k,
+    const Internlm2Config &config,
+    uint32_t start_position,
+    ops::OperatorContext context) {
+    require_execution_device(q, context.device, "rope", "q");
+    require_execution_device(k, context.device, "rope", "k");
+    if (context.device.is_cpu()) {
+        apply_rope_inplace_cpu(q, k, config, start_position);
+        return;
+    }
+
+    if (context.device.is_cuda()) {
+#if defined(SLLMRF_USE_CUDA) && SLLMRF_USE_CUDA
+        if (cuda_backend_enabled()) {
+            internlm2_cuda::apply_rope_inplace(q, k, config, start_position);
+            return;
+        }
+#endif
+        auto cpu_q = q.copy_to(Device::cpu());
+        auto cpu_k = k.copy_to(Device::cpu());
+        apply_rope_inplace_cpu(cpu_q, cpu_k, config, start_position);
+        q = cpu_q.copy_to(context.device);
+        k = cpu_k.copy_to(context.device);
+        return;
+    }
+
+    throw GgufError("rope native CUDA backend is not implemented yet");
+}
+
+void write_kv_cache_cpu(
     KvCacheLayer &layer,
     const TensorBuffer &k,
     const TensorBuffer &v,
@@ -320,7 +408,45 @@ void write_kv_cache(
     }
 }
 
-TensorBuffer causal_attention(
+void write_kv_cache(
+    KvCacheLayer &layer,
+    const TensorBuffer &k,
+    const TensorBuffer &v,
+    uint32_t start_position,
+    const Internlm2Config &config,
+    ops::OperatorContext context) {
+    require_execution_device(k, context.device, "write_kv_cache", "k");
+    require_execution_device(v, context.device, "write_kv_cache", "v");
+    require_execution_device(layer.key, context.device, "write_kv_cache", "layer.key");
+    require_execution_device(layer.value, context.device, "write_kv_cache", "layer.value");
+    if (context.device.is_cpu()) {
+        write_kv_cache_cpu(layer, k, v, start_position, config);
+        return;
+    }
+
+    if (context.device.is_cuda()) {
+#if defined(SLLMRF_USE_CUDA) && SLLMRF_USE_CUDA
+        if (cuda_backend_enabled()) {
+            internlm2_cuda::write_kv_cache(layer, k, v, start_position, config);
+            return;
+        }
+#endif
+        KvCacheLayer cpu_layer {
+            .key = layer.key.copy_to(Device::cpu()),
+            .value = layer.value.copy_to(Device::cpu()),
+        };
+        auto cpu_k = k.copy_to(Device::cpu());
+        auto cpu_v = v.copy_to(Device::cpu());
+        write_kv_cache_cpu(cpu_layer, cpu_k, cpu_v, start_position, config);
+        layer.key = cpu_layer.key.copy_to(context.device);
+        layer.value = cpu_layer.value.copy_to(context.device);
+        return;
+    }
+
+    throw GgufError("write_kv_cache native CUDA backend is not implemented yet");
+}
+
+TensorBuffer causal_attention_cpu(
     const TensorBuffer &q,
     const KvCacheLayer &cache,
     uint32_t start_position,
@@ -329,7 +455,7 @@ TensorBuffer causal_attention(
     const auto kv_group_size = config.attention_head_count / config.attention_head_count_kv;
     const auto scale = 1.0F / std::sqrt(static_cast<float>(head_dim));
 
-    TensorBuffer context({q.rows(), q.cols()});
+    TensorBuffer context({q.rows(), q.cols()}, 0.0F, q.device());
     const auto task_count =
         static_cast<std::int64_t>(q.rows()) * static_cast<std::int64_t>(config.attention_head_count);
     #if defined(_OPENMP)
@@ -371,6 +497,37 @@ TensorBuffer causal_attention(
     }
 
     return context;
+}
+
+TensorBuffer causal_attention(
+    const TensorBuffer &q,
+    const KvCacheLayer &cache,
+    uint32_t start_position,
+    const Internlm2Config &config,
+    ops::OperatorContext context) {
+    require_execution_device(q, context.device, "causal_attention", "q");
+    require_execution_device(cache.key, context.device, "causal_attention", "cache.key");
+    require_execution_device(cache.value, context.device, "causal_attention", "cache.value");
+    if (context.device.is_cpu()) {
+        return causal_attention_cpu(q, cache, start_position, config);
+    }
+
+    if (context.device.is_cuda()) {
+#if defined(SLLMRF_USE_CUDA) && SLLMRF_USE_CUDA
+        if (cuda_backend_enabled()) {
+            return internlm2_cuda::causal_attention(q, cache, start_position, config);
+        }
+#endif
+        KvCacheLayer cpu_cache {
+            .key = cache.key.copy_to(Device::cpu()),
+            .value = cache.value.copy_to(Device::cpu()),
+        };
+        auto cpu_q = q.copy_to(Device::cpu());
+        auto cpu_context = causal_attention_cpu(cpu_q, cpu_cache, start_position, config);
+        return cpu_context.copy_to(context.device);
+    }
+
+    throw GgufError("causal_attention native CUDA backend is not implemented yet");
 }
 
 }  // namespace
@@ -454,8 +611,12 @@ Internlm2TensorLayout Internlm2TensorLayout::build(const Internlm2Config &config
     return layout;
 }
 
-Internlm2Runtime::Internlm2Runtime(const Internlm2Config &config, uint32_t max_sequence_length)
-    : max_sequence_length_(max_sequence_length == 0U ? config.context_length : max_sequence_length) {
+Internlm2Runtime::Internlm2Runtime(
+    const Internlm2Config &config,
+    uint32_t max_sequence_length,
+    ops::OperatorContext context)
+    : max_sequence_length_(max_sequence_length == 0U ? config.context_length : max_sequence_length),
+      context_(context) {
     if (max_sequence_length_ == 0U) {
         throw GgufError("internlm2 runtime max sequence length must be greater than zero");
     }
@@ -464,9 +625,13 @@ Internlm2Runtime::Internlm2Runtime(const Internlm2Config &config, uint32_t max_s
     for (uint32_t index = 0; index < config.block_count; ++index) {
         layers_.push_back(KvCacheLayer {
             .key = TensorBuffer(
-                {max_sequence_length_, config.attention_head_count_kv, config.head_dimension()}),
+                {max_sequence_length_, config.attention_head_count_kv, config.head_dimension()},
+                0.0F,
+                context.device),
             .value = TensorBuffer(
-                {max_sequence_length_, config.attention_head_count_kv, config.head_dimension()}),
+                {max_sequence_length_, config.attention_head_count_kv, config.head_dimension()},
+                0.0F,
+                context.device),
         });
     }
 }
@@ -476,6 +641,10 @@ void Internlm2Runtime::reset() {
     for (auto &layer : layers_) {
         std::fill(layer.key.values().begin(), layer.key.values().end(), 0.0F);
         std::fill(layer.value.values().begin(), layer.value.values().end(), 0.0F);
+        if (!context_.device.is_cpu()) {
+            layer.key.sync_host_to_device();
+            layer.value.sync_host_to_device();
+        }
     }
 }
 
@@ -485,6 +654,10 @@ uint32_t Internlm2Runtime::max_sequence_length() const noexcept {
 
 uint32_t Internlm2Runtime::consumed_tokens() const noexcept {
     return consumed_tokens_;
+}
+
+const ops::OperatorContext &Internlm2Runtime::context() const noexcept {
+    return context_;
 }
 
 const std::vector<KvCacheLayer> &Internlm2Runtime::layers() const noexcept {
@@ -588,11 +761,13 @@ PromptBatch Internlm2Model::prepare_prompt(std::string_view text, bool add_bos, 
     return prompt;
 }
 
-Internlm2Runtime Internlm2Model::create_runtime(uint32_t max_sequence_length) const {
-    return Internlm2Runtime(config_, max_sequence_length);
+Internlm2Runtime Internlm2Model::create_runtime(
+    uint32_t max_sequence_length,
+    ops::OperatorContext context) const {
+    return Internlm2Runtime(config_, max_sequence_length, context);
 }
 
-TensorBuffer Internlm2Model::embed_tokens(const std::vector<uint32_t> &token_ids) const {
+TensorBuffer Internlm2Model::embed_tokens(const std::vector<uint32_t> &token_ids, Device device) const {
     const auto embedding_info = weights_.require_info(layout_.token_embedding);
     if (embedding_info.dimensions.size() != 2U) {
         throw GgufError("token_embd.weight is expected to be a 2D tensor");
@@ -606,8 +781,20 @@ TensorBuffer Internlm2Model::embed_tokens(const std::vector<uint32_t> &token_ids
         }
     }
 
-    TensorBuffer hidden_state({static_cast<uint64_t>(token_ids.size()), row_width});
+#if defined(SLLMRF_USE_CUDA) && SLLMRF_USE_CUDA
+    if (device.is_cuda() && cuda_backend_enabled()) {
+        return ops::cuda::embedding_lookup(
+            weights_.require_tensor(layout_.token_embedding),
+            token_ids,
+            device);
+    }
+#endif
+
+    TensorBuffer hidden_state({static_cast<uint64_t>(token_ids.size()), row_width}, 0.0F, device);
     hidden_state.values() = weights_.read_rows_f32(layout_.token_embedding, token_ids);
+    if (!device.is_cpu()) {
+        hidden_state.sync_host_to_device();
+    }
     return hidden_state;
 }
 
@@ -615,13 +802,13 @@ TensorBuffer Internlm2Model::run_prompt_embedding(
     const PromptBatch &prompt,
     Internlm2Runtime &runtime) const {
     if (prompt.token_ids.empty()) {
-        return TensorBuffer({0U, config_.embedding_length});
+        return TensorBuffer({0U, config_.embedding_length}, 0.0F, runtime.context().device);
     }
     if (runtime.consumed_tokens() + prompt.token_ids.size() > runtime.max_sequence_length()) {
         throw GgufError("prompt does not fit in allocated internlm2 runtime cache");
     }
 
-    auto hidden_state = embed_tokens(prompt.token_ids);
+    auto hidden_state = embed_tokens(prompt.token_ids, runtime.context().device);
     runtime.mark_tokens_consumed(static_cast<uint32_t>(prompt.token_ids.size()));
     return hidden_state;
 }
@@ -738,16 +925,21 @@ std::string Internlm2Model::describe_pipeline() const {
     return stream.str();
 }
 
-TensorBuffer Internlm2Model::apply_final_norm(const TensorBuffer &hidden_state) const {
+TensorBuffer Internlm2Model::apply_final_norm(
+    const TensorBuffer &hidden_state,
+    ops::OperatorContext context) const {
     const auto weight_info = weights_.require_info(layout_.output_norm);
     if (weight_info.dimensions.size() != 1U || weight_info.dimensions[0] != config_.embedding_length) {
         throw GgufError("output_norm.weight shape does not match embedding length");
     }
 
+    const auto effective_context =
+        context.device == hidden_state.device() ? context : context_for_device(hidden_state.device());
     return ops::rms_norm(
         hidden_state,
-        weights_.read_tensor_f32(layout_.output_norm),
-        config_.rms_norm_epsilon);
+        weights_.require_tensor(layout_.output_norm),
+        config_.rms_norm_epsilon,
+        effective_context);
 }
 
 TensorBuffer Internlm2Model::forward_prompt(
@@ -771,35 +963,43 @@ TensorBuffer Internlm2Model::forward_layer(
     if (runtime.consumed_tokens() < hidden_state.rows()) {
         throw GgufError("runtime consumed token count is inconsistent with hidden state length");
     }
+    if (hidden_state.device() != runtime.context().device) {
+        throw GgufError("forward_layer hidden state device does not match runtime execution device");
+    }
 
     const auto start_position =
         runtime.consumed_tokens() - static_cast<uint32_t>(hidden_state.rows());
     const auto &names = layout_.layers[static_cast<std::size_t>(layer_index)];
+    const auto context = runtime.context();
 
     const auto attn_norm = ops::rms_norm(
         hidden_state,
-        weights_.read_tensor_f32(names.attention_norm),
-        config_.rms_norm_epsilon);
-    auto q = linear_project(weights_, names.attention_q, attn_norm);
-    auto k = linear_project(weights_, names.attention_k, attn_norm);
-    auto v = linear_project(weights_, names.attention_v, attn_norm);
+        weights_.require_tensor(names.attention_norm),
+        config_.rms_norm_epsilon,
+        context);
+    auto q = linear_project(weights_, names.attention_q, attn_norm, context);
+    auto k = linear_project(weights_, names.attention_k, attn_norm, context);
+    auto v = linear_project(weights_, names.attention_v, attn_norm, context);
 
-    apply_rope_inplace(q, k, config_, start_position);
-    write_kv_cache(runtime.layers()[layer_index], k, v, start_position, config_);
+    apply_rope_inplace(q, k, config_, start_position, context);
+    write_kv_cache(runtime.layers()[layer_index], k, v, start_position, config_, context);
 
-    const auto attention_context = causal_attention(q, runtime.layers()[layer_index], start_position, config_);
-    const auto attention_output = linear_project(weights_, names.attention_output, attention_context);
-    auto hidden = ops::add(hidden_state, attention_output);
+    const auto attention_context =
+        causal_attention(q, runtime.layers()[layer_index], start_position, config_, context);
+    const auto attention_output =
+        linear_project(weights_, names.attention_output, attention_context, context);
+    auto hidden = ops::add(hidden_state, attention_output, context);
 
     const auto ffn_norm = ops::rms_norm(
         hidden,
-        weights_.read_tensor_f32(names.ffn_norm),
-        config_.rms_norm_epsilon);
-    const auto gate = linear_project(weights_, names.ffn_gate, ffn_norm);
-    const auto up = linear_project(weights_, names.ffn_up, ffn_norm);
-    const auto swiglu = ops::multiply(ops::silu(gate), up);
-    const auto down = linear_project(weights_, names.ffn_down, swiglu);
-    hidden = ops::add(hidden, down);
+        weights_.require_tensor(names.ffn_norm),
+        config_.rms_norm_epsilon,
+        context);
+    const auto gate = linear_project(weights_, names.ffn_gate, ffn_norm, context);
+    const auto up = linear_project(weights_, names.ffn_up, ffn_norm, context);
+    const auto swiglu = ops::multiply(ops::silu(gate, context), up, context);
+    const auto down = linear_project(weights_, names.ffn_down, swiglu, context);
+    hidden = ops::add(hidden, down, context);
 
     return hidden;
 }
@@ -810,6 +1010,9 @@ TensorBuffer Internlm2Model::forward_blocks(
     uint32_t layer_count) const {
     if (config_.block_count == 0U) {
         return hidden_state;
+    }
+    if (hidden_state.device() != runtime.context().device) {
+        throw GgufError("forward_blocks hidden state device does not match runtime execution device");
     }
 
     const auto max_layers = layer_count == 0U
@@ -827,8 +1030,8 @@ std::vector<float> Internlm2Model::compute_logits(const TensorBuffer &hidden_sta
         return {};
     }
 
-    const auto normalized = apply_final_norm(hidden_state);
-    const auto last_token = normalized.row(normalized.rows() - 1U);
+    const auto context = context_for_device(hidden_state.device());
+    const auto normalized = apply_final_norm(hidden_state, context);
     const auto output = weights_.require_tensor(layout_.output);
     if (output.dimensions.size() != 2U) {
         throw GgufError("output.weight is expected to be a 2D tensor");
@@ -836,6 +1039,16 @@ std::vector<float> Internlm2Model::compute_logits(const TensorBuffer &hidden_sta
     if (output.row_width() != config_.embedding_length) {
         throw GgufError("output.weight hidden dimension does not match embedding length");
     }
+
+#if defined(SLLMRF_USE_CUDA) && SLLMRF_USE_CUDA
+    if (normalized.device().is_cuda() && cuda_backend_enabled()) {
+        return ops::cuda::project_last_token_logits(output, normalized);
+    }
+#endif
+
+    const auto normalized_cpu =
+        normalized.device().is_cpu() ? normalized : normalized.copy_to(Device::cpu());
+    const auto last_token = normalized_cpu.row(normalized_cpu.rows() - 1U);
 
     const auto vocab_size = static_cast<std::size_t>(output.row_count());
     const auto hidden_size = static_cast<std::size_t>(output.row_width());
@@ -891,14 +1104,16 @@ GenerationResult Internlm2Model::generate(
     std::string_view prompt,
     const GenerationConfig &config) const {
     GenerationResult result;
+    const auto prompt_batch = prepare_prompt(prompt, config.add_bos, false);
     if (config.max_new_tokens == 0U) {
-        result.prompt_token_ids = prepare_prompt(prompt, config.add_bos, false).token_ids;
+        result.prompt_token_ids = prompt_batch.token_ids;
         result.full_text = std::string(prompt);
         return result;
     }
 
-    auto runtime = create_runtime();
-    const auto prompt_batch = prepare_prompt(prompt, config.add_bos, false);
+    auto runtime = create_runtime(
+        resolve_runtime_sequence_length(config_, prompt_batch.token_ids.size(), config.max_new_tokens),
+        config.execution_context);
     result.prompt_token_ids = prompt_batch.token_ids;
 
     auto hidden = forward_prompt(prompt_batch, runtime, config.layer_count);

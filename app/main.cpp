@@ -9,12 +9,39 @@
 
 namespace {
 
+[[nodiscard]] sllmrf::ops::OperatorContext parse_execution_device(std::string_view value) {
+    if (value == "cpu") {
+        return sllmrf::ops::OperatorContext::cpu();
+    }
+    if (value == "cuda") {
+        return sllmrf::ops::OperatorContext::cuda(0);
+    }
+    constexpr std::string_view prefix = "cuda:";
+    if (value.rfind(prefix, 0) == 0U) {
+        return sllmrf::ops::OperatorContext::cuda(
+            static_cast<uint32_t>(std::stoul(std::string(value.substr(prefix.size())))));
+    }
+
+    throw std::invalid_argument("unsupported device string");
+}
+
+[[nodiscard]] uint32_t resolve_runtime_sequence_length(
+    const sllmrf::Internlm2Config &config,
+    std::size_t prompt_token_count,
+    uint32_t max_new_tokens) {
+    const auto requested = static_cast<uint64_t>(prompt_token_count) + static_cast<uint64_t>(max_new_tokens);
+    const auto bounded = std::min<uint64_t>(
+        config.context_length,
+        std::max<uint64_t>(1U, requested));
+    return static_cast<uint32_t>(bounded);
+}
+
 void print_usage(std::string_view program) {
     std::cout
         << "Usage: " << program
         << " [--model <path>] [--prompt <text>] [--no-bos] [--eos] [--embedding-preview <n>] [--run-one-block]"
         << " [--run-all-blocks] [--layers <n>] [--logits-preview <n>] [--generate <n>]"
-        << " [--stochastic] [--temperature <value>] [--seed <value>]\n"
+        << " [--stochastic] [--temperature <value>] [--seed <value>] [--device <cpu|cuda[:n]>]\n"
         << "       " << program << " --help\n";
 }
 
@@ -37,6 +64,7 @@ int main(int argc, char **argv) {
     float temperature = 1.0F;
     uint64_t seed = 0U;
     bool use_seed = false;
+    auto execution_context = sllmrf::ops::OperatorContext::cpu();
 
     for (int index = 1; index < argc; ++index) {
         const std::string arg = argv[index];
@@ -133,6 +161,19 @@ int main(int argc, char **argv) {
             use_seed = true;
             continue;
         }
+        if (arg == "--device") {
+            if (index + 1 >= argc) {
+                std::cerr << "--device requires a value\n";
+                return 1;
+            }
+            try {
+                execution_context = parse_execution_device(argv[++index]);
+            } catch (const std::exception &) {
+                std::cerr << "unsupported device: " << argv[index] << '\n';
+                return 1;
+            }
+            continue;
+        }
 
         std::cerr << "unknown argument: " << arg << '\n';
         print_usage(argv[0]);
@@ -156,6 +197,7 @@ int main(int argc, char **argv) {
         std::cout << "kv heads: " << model.config().attention_head_count_kv << '\n';
         std::cout << "head dimension: " << model.config().head_dimension() << '\n';
         std::cout << "vocab size: " << model.tokenizer().vocab_size() << '\n';
+        std::cout << "execution device: " << execution_context.device.to_string() << '\n';
         std::cout << model.describe_pipeline();
         if (show_plan) {
             std::cout << model.build_prefill_plan().describe();
@@ -182,11 +224,14 @@ int main(int argc, char **argv) {
             }
             std::cout << '\n';
 
-            auto runtime = model.create_runtime();
+            auto runtime = model.create_runtime(
+                resolve_runtime_sequence_length(model.config(), batch.token_ids.size(), generate_tokens),
+                execution_context);
             const auto embedding = model.run_prompt_embedding(batch, runtime);
             std::cout << "embedding shape: " << embedding.shape_string() << '\n';
             std::cout << "runtime consumed tokens: " << runtime.consumed_tokens() << '\n';
             std::cout << "kv cache layers: " << runtime.layers().size() << '\n';
+            std::cout << "embedding device: " << embedding.placement_string() << '\n';
 
             const auto preview = std::min<std::size_t>(embedding.values().size(), embedding_preview);
             std::cout << "embedding preview:";
@@ -207,7 +252,9 @@ int main(int argc, char **argv) {
             }
 
             if (run_all_blocks || requested_layers > 0U) {
-                auto rollout_runtime = model.create_runtime();
+                auto rollout_runtime = model.create_runtime(
+                    resolve_runtime_sequence_length(model.config(), batch.token_ids.size(), generate_tokens),
+                    execution_context);
                 const auto rollout_hidden = model.forward_prompt(batch, rollout_runtime, requested_layers);
                 const auto layers_ran =
                     requested_layers == 0U ? model.config().block_count : std::min(requested_layers, model.config().block_count);
@@ -238,6 +285,7 @@ int main(int argc, char **argv) {
                         .add_bos = add_bos,
                         .stop_at_eos = true,
                         .layer_count = requested_layers,
+                        .execution_context = execution_context,
                         .sampling_strategy = use_stochastic_sampling
                             ? sllmrf::SamplingStrategy::Stochastic
                             : sllmrf::SamplingStrategy::Greedy,

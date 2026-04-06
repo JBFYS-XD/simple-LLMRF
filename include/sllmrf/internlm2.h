@@ -96,6 +96,7 @@ struct GenerationConfig {
     bool add_bos {true};
     bool stop_at_eos {true};
     uint32_t layer_count {0};
+    ops::OperatorContext execution_context {ops::OperatorContext::cpu()};
     SamplingStrategy sampling_strategy {SamplingStrategy::Greedy};
     float temperature {1.0F};
     uint64_t seed {0U};
@@ -112,12 +113,16 @@ struct GenerationResult {
 class Internlm2Runtime {
 public:
     Internlm2Runtime() = default;
-    Internlm2Runtime(const Internlm2Config &config, uint32_t max_sequence_length);
+    Internlm2Runtime(
+        const Internlm2Config &config,
+        uint32_t max_sequence_length,
+        ops::OperatorContext context = ops::OperatorContext::cpu());
 
     void reset();
 
     [[nodiscard]] uint32_t max_sequence_length() const noexcept;
     [[nodiscard]] uint32_t consumed_tokens() const noexcept;
+    [[nodiscard]] const ops::OperatorContext &context() const noexcept;
     [[nodiscard]] const std::vector<KvCacheLayer> &layers() const noexcept;
     [[nodiscard]] std::vector<KvCacheLayer> &layers() noexcept;
 
@@ -126,6 +131,7 @@ public:
 private:
     uint32_t max_sequence_length_ {0};
     uint32_t consumed_tokens_ {0};
+    ops::OperatorContext context_ {ops::OperatorContext::cpu()};
     std::vector<KvCacheLayer> layers_;
 };
 
@@ -143,14 +149,20 @@ public:
         std::string_view text,
         bool add_bos = true,
         bool add_eos = false) const;
-    [[nodiscard]] Internlm2Runtime create_runtime(uint32_t max_sequence_length = 0) const;
-    [[nodiscard]] TensorBuffer embed_tokens(const std::vector<uint32_t> &token_ids) const;
+    [[nodiscard]] Internlm2Runtime create_runtime(
+        uint32_t max_sequence_length = 0,
+        ops::OperatorContext context = ops::OperatorContext::cpu()) const;
+    [[nodiscard]] TensorBuffer embed_tokens(
+        const std::vector<uint32_t> &token_ids,
+        Device device = Device::cpu()) const;
     [[nodiscard]] TensorBuffer run_prompt_embedding(
         const PromptBatch &prompt,
         Internlm2Runtime &runtime) const;
     [[nodiscard]] Internlm2ExecutionPlan build_prefill_plan() const;
     [[nodiscard]] std::string describe_pipeline() const;
-    [[nodiscard]] TensorBuffer apply_final_norm(const TensorBuffer &hidden_state) const;
+    [[nodiscard]] TensorBuffer apply_final_norm(
+        const TensorBuffer &hidden_state,
+        ops::OperatorContext context = ops::OperatorContext::cpu()) const;
     [[nodiscard]] TensorBuffer forward_prompt(
         const PromptBatch &prompt,
         Internlm2Runtime &runtime,
