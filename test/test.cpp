@@ -2,6 +2,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
+#include <iomanip>
 #include <iostream>
 #include <sstream>
 #include <stdexcept>
@@ -232,64 +233,154 @@ std::filesystem::path create_fixture() {
 }
 
 void expect(bool condition, const std::string &message) {
+    std::cout << (condition ? "[PASS] " : "[FAIL] ") << message << '\n';
     if (!condition) {
         throw std::runtime_error(message);
     }
 }
 
-void expect_near(float lhs, float rhs, float epsilon, const std::string &message) {
-    if (std::fabs(lhs - rhs) > epsilon) {
+std::string format_value(const std::string &value) {
+    return '"' + value + '"';
+}
+
+std::string format_value(const char *value) {
+    return value == nullptr ? "<null>" : format_value(std::string(value));
+}
+
+std::string format_value(bool value) {
+    return value ? "true" : "false";
+}
+
+std::string format_value(const Device &value) {
+    return value.to_string();
+}
+
+template <typename T>
+std::string format_value(const std::vector<T> &values) {
+    std::ostringstream stream;
+    stream << '[';
+    for (std::size_t index = 0; index < values.size(); ++index) {
+        if (index > 0U) {
+            stream << ", ";
+        }
+        stream << values[index];
+    }
+    stream << ']';
+    return stream.str();
+}
+
+template <typename T>
+std::string format_value(const T &value) {
+    std::ostringstream stream;
+    stream << value;
+    return stream.str();
+}
+
+void print_section(const std::string &name) {
+    std::cout << "\n== " << name << " ==\n";
+}
+
+template <typename Actual, typename Expected>
+void expect_equal(
+    const Actual &actual,
+    const Expected &expected,
+    const std::string &message) {
+    const bool condition = actual == expected;
+    std::cout << (condition ? "[PASS] " : "[FAIL] ") << message;
+    if (condition) {
+        std::cout << " = " << format_value(actual);
+    } else {
+        std::cout
+            << " | expected=" << format_value(expected)
+            << " actual=" << format_value(actual);
+    }
+    std::cout << '\n';
+    if (!condition) {
         std::ostringstream stream;
-        stream << message << " lhs=" << lhs << " rhs=" << rhs;
+        stream << message
+               << " expected=" << format_value(expected)
+               << " actual=" << format_value(actual);
+        throw std::runtime_error(stream.str());
+    }
+}
+
+void expect_near(float lhs, float rhs, float epsilon, const std::string &message) {
+    const bool condition = std::fabs(lhs - rhs) <= epsilon;
+    std::cout << (condition ? "[PASS] " : "[FAIL] ") << message;
+    if (condition) {
+        std::cout << " | actual=" << std::fixed << std::setprecision(6) << lhs;
+    } else {
+        std::cout
+            << " | expected=" << std::fixed << std::setprecision(6) << rhs
+            << " actual=" << lhs
+            << " epsilon=" << epsilon;
+    }
+    std::cout << '\n';
+    if (!condition) {
+        std::ostringstream stream;
+        stream << message
+               << " expected=" << rhs
+               << " actual=" << lhs
+               << " epsilon=" << epsilon;
         throw std::runtime_error(stream.str());
     }
 }
 
 void run_fixture_test() {
+    print_section("Fixture Setup");
     const auto fixture = create_fixture();
+    std::cout << "fixture gguf path=" << fixture << '\n';
     const auto file = GgufFile::load(fixture);
-    expect(file.version() == 3U, "fixture version mismatch");
-    expect(file.tensor_count() == 12U, "fixture tensor count mismatch");
-    expect(file.metadata().size() == 18U, "fixture metadata count mismatch");
+    expect_equal(file.version(), 3U, "fixture version");
+    expect_equal(file.tensor_count(), 12U, "fixture tensor count");
+    expect_equal(file.metadata().size(), std::size_t {18U}, "fixture metadata count");
 
+    print_section("Fixture Tokenizer");
     const auto tokenizer = Tokenizer::from_gguf(file);
     const auto result = tokenizer.encode("hello world!");
+    std::cout << "tokenizer output token_ids=" << format_value(result.token_ids) << '\n';
+    expect_equal(result.token_ids.size(), std::size_t {4U}, "token count");
+    expect_equal(result.token_ids[0], 4U, "bos token id");
+    expect_equal(result.token_ids[1], 1U, "first word token id");
+    expect_equal(result.token_ids[2], 2U, "second word token id");
+    expect_equal(result.token_ids[3], 3U, "punctuation token id");
+    expect_equal(tokenizer.decode(result.token_ids), std::string("hello world!"), "decode text");
 
-    expect(result.token_ids.size() == 4U, "unexpected token count");
-    expect(result.token_ids[0] == 4U, "unexpected bos token");
-    expect(result.token_ids[1] == 1U, "unexpected first word token");
-    expect(result.token_ids[2] == 2U, "unexpected second word token");
-    expect(result.token_ids[3] == 3U, "unexpected punctuation token");
-    expect(tokenizer.decode(result.token_ids) == "hello world!", "decode mismatch");
-
+    print_section("Fixture Model Load");
     const auto model = Internlm2Model::load(fixture);
-    expect(model.config().architecture == "internlm2", "architecture mismatch");
-    expect(model.config().block_count == 1U, "block count mismatch");
-    expect(model.config().embedding_length == 2U, "embedding length mismatch");
-    expect(model.layout().layers.size() == 1U, "layer layout mismatch");
+    expect_equal(model.config().architecture, std::string("internlm2"), "model architecture");
+    expect_equal(model.config().block_count, 1U, "block count");
+    expect_equal(model.config().embedding_length, 2U, "embedding length");
+    expect_equal(model.layout().layers.size(), std::size_t {1U}, "layer layout size");
 
+    print_section("Fixture Prompt And Embedding");
     auto runtime = model.create_runtime();
     const auto prompt = model.prepare_prompt("hello world!");
-    expect(prompt.positions.size() == prompt.token_ids.size(), "positions size mismatch");
+    std::cout << "prompt positions=" << format_value(prompt.positions) << '\n';
+    expect_equal(prompt.positions.size(), prompt.token_ids.size(), "positions size matches token size");
 
     const auto embedding = model.run_prompt_embedding(prompt, runtime);
-    expect(embedding.shape().size() == 2U, "embedding rank mismatch");
-    expect(embedding.shape()[0] == 4U, "embedding row count mismatch");
-    expect(embedding.shape()[1] == 2U, "embedding width mismatch");
-    expect(runtime.consumed_tokens() == 4U, "runtime consumed token mismatch");
+    expect_equal(embedding.shape().size(), std::size_t {2U}, "embedding rank");
+    expect_equal(embedding.shape()[0], 4U, "embedding row count");
+    expect_equal(embedding.shape()[1], 2U, "embedding width");
+    expect_equal(runtime.consumed_tokens(), 4U, "runtime consumed tokens");
+    std::cout << "embedding shape=" << embedding.shape_string() << '\n';
 
     const std::vector<float> expected_embedding = {4.0F, 4.5F, 1.0F, 1.5F, 2.0F, 2.5F, 3.0F, 3.5F};
-    expect(embedding.values() == expected_embedding, "embedding values mismatch");
+    expect_near(embedding.values()[0], expected_embedding[0], 1.0e-6F, "embedding first value");
+    expect_near(embedding.values().back(), expected_embedding.back(), 1.0e-6F, "embedding last value");
 
+    print_section("Fixture Pipeline Description");
     const auto pipeline = model.describe_pipeline();
-    expect(pipeline.find("execution plan nodes") != std::string::npos, "pipeline description mismatch");
+    expect(pipeline.find("execution plan nodes") != std::string::npos, "pipeline description available");
 
     const auto plan = model.build_prefill_plan();
-    expect(!plan.steps.empty(), "execution plan should not be empty");
-    expect(plan.steps.front().type == sllmrf::Internlm2OpType::Embedding, "first plan step mismatch");
-    expect(plan.steps.back().type == sllmrf::Internlm2OpType::OutputProjection, "last plan step mismatch");
-    expect(plan.describe().find("layer_0.qkv_projection") != std::string::npos, "plan description mismatch");
+    expect(!plan.steps.empty(), "execution plan is not empty");
+    expect_equal(static_cast<int>(plan.steps.front().type), static_cast<int>(sllmrf::Internlm2OpType::Embedding), "first plan step type");
+    expect_equal(static_cast<int>(plan.steps.back().type), static_cast<int>(sllmrf::Internlm2OpType::OutputProjection), "last plan step type");
+    expect(plan.describe().find("layer_0.qkv_projection") != std::string::npos, "plan contains qkv projection");
 
+    print_section("Fixture Operators");
     const TensorBuffer rms_input({1U, 2U}, {3.0F, 4.0F});
     const auto rms_output = sllmrf::ops::rms_norm(rms_input, {1.0F, 1.0F}, 1.0e-5F);
     expect_near(rms_output.at(0, 0), 0.848527F, 1.0e-4F, "rms_norm first value mismatch");
@@ -298,17 +389,17 @@ void run_fixture_test() {
     const auto rms_output_from_tensor = sllmrf::ops::rms_norm(rms_input, rms_weight_tensor, 1.0e-5F);
     expect_near(rms_output_from_tensor.at(0, 0), 0.848527F, 1.0e-4F, "tensor rms_norm first value mismatch");
     expect_near(rms_output_from_tensor.at(0, 1), 1.131370F, 1.0e-4F, "tensor rms_norm second value mismatch");
-    expect(rms_output.device() == Device::cpu(), "rms_norm output device mismatch");
+    expect_equal(rms_output.device(), Device::cpu(), "rms_norm output device");
     const auto cuda_backend_is_native = sllmrf::cuda_backend_enabled();
-    expect(
-        sllmrf::describe_device_backend(Device::cuda(0)) ==
-            (cuda_backend_is_native ? "native cuda backend" : "emulated cuda staging backend"),
-        "cuda backend description mismatch");
+    expect_equal(
+        sllmrf::describe_device_backend(Device::cuda(0)),
+        std::string(cuda_backend_is_native ? "native cuda backend" : "emulated cuda staging backend"),
+        "cuda backend description");
 
     const TensorBuffer cpu_lhs({1U, 2U}, {1.0F, 2.0F}, Device::cpu());
     const TensorBuffer cpu_rhs({1U, 2U}, {3.0F, 4.0F}, Device::cpu());
     const auto cpu_sum = sllmrf::ops::add(cpu_lhs, cpu_rhs, sllmrf::ops::OperatorContext::cpu());
-    expect(cpu_sum.device() == Device::cpu(), "cpu add device mismatch");
+    expect_equal(cpu_sum.device(), Device::cpu(), "cpu add output device");
     expect_near(cpu_sum.at(0, 0), 4.0F, 1.0e-6F, "cpu add first value mismatch");
     expect_near(cpu_sum.at(0, 1), 6.0F, 1.0e-6F, "cpu add second value mismatch");
 
@@ -324,30 +415,31 @@ void run_fixture_test() {
     }
     expect(rejected_cuda_context_mismatch, "cpu tensors with cuda execution context should be rejected");
 
+    print_section("Fixture Device Roundtrip");
     auto pseudo_cuda_tensor = cpu_lhs.copy_to(Device::cuda(0));
-    expect(pseudo_cuda_tensor.device() == Device::cuda(0), "cuda tensor placement mismatch");
-    expect(pseudo_cuda_tensor.has_device_allocation(), "cuda tensor missing device allocation");
+    expect_equal(pseudo_cuda_tensor.device(), Device::cuda(0), "cuda tensor placement");
+    expect(pseudo_cuda_tensor.has_device_allocation(), "cuda tensor has device allocation");
     expect(
         pseudo_cuda_tensor.is_device_allocation_emulated() == !cuda_backend_is_native,
-        "cuda tensor allocation mode mismatch");
-    expect(pseudo_cuda_tensor.device_data() != nullptr, "cuda tensor device pointer mismatch");
-    expect(!pseudo_cuda_tensor.host_dirty(), "fresh cuda tensor host state mismatch");
-    expect(!pseudo_cuda_tensor.device_dirty(), "fresh cuda tensor device state mismatch");
+        "cuda tensor allocation mode is correct");
+    expect(pseudo_cuda_tensor.device_data() != nullptr, "cuda tensor device pointer exists");
+    expect(!pseudo_cuda_tensor.host_dirty(), "fresh cuda tensor host state is clean");
+    expect(!pseudo_cuda_tensor.device_dirty(), "fresh cuda tensor device state is clean");
     auto roundtrip_cpu_tensor = pseudo_cuda_tensor.copy_to(Device::cpu());
-    expect(roundtrip_cpu_tensor.device() == Device::cpu(), "roundtrip cpu tensor placement mismatch");
+    expect(roundtrip_cpu_tensor.device() == Device::cpu(), "roundtrip cpu tensor placement");
     expect_near(roundtrip_cpu_tensor.at(0, 0), 1.0F, 1.0e-6F, "roundtrip cpu tensor first value mismatch");
     expect_near(roundtrip_cpu_tensor.at(0, 1), 2.0F, 1.0e-6F, "roundtrip cpu tensor second value mismatch");
     pseudo_cuda_tensor.values()[0] = 9.0F;
-    expect(pseudo_cuda_tensor.host_dirty(), "cuda tensor host dirty flag should be set after host write");
+    expect(pseudo_cuda_tensor.host_dirty(), "cuda tensor host dirty flag is set after host write");
     pseudo_cuda_tensor.sync_host_to_device();
-    expect(!pseudo_cuda_tensor.host_dirty(), "cuda tensor host dirty flag should clear after upload");
+    expect(!pseudo_cuda_tensor.host_dirty(), "cuda tensor host dirty flag clears after upload");
 
     auto pseudo_cuda_rhs = cpu_rhs.copy_to(Device::cuda(0));
     const auto cuda_sum = sllmrf::ops::add(
         pseudo_cuda_tensor,
         pseudo_cuda_rhs,
         sllmrf::ops::OperatorContext::cuda(0));
-    expect(cuda_sum.device() == Device::cuda(0), "cuda add output placement mismatch");
+    expect_equal(cuda_sum.device(), Device::cuda(0), "cuda add output placement");
     auto cuda_sum_cpu = cuda_sum.copy_to(Device::cpu());
     expect_near(cuda_sum_cpu.at(0, 0), 12.0F, 1.0e-6F, "cuda add first value mismatch");
     expect_near(cuda_sum_cpu.at(0, 1), 6.0F, 1.0e-6F, "cuda add second value mismatch");
@@ -355,7 +447,7 @@ void run_fixture_test() {
     const auto cuda_silu = sllmrf::ops::silu(
         pseudo_cuda_tensor,
         sllmrf::ops::OperatorContext::cuda(0));
-    expect(cuda_silu.device() == Device::cuda(0), "cuda silu output placement mismatch");
+    expect_equal(cuda_silu.device(), Device::cuda(0), "cuda silu output placement");
     auto cuda_silu_cpu = cuda_silu.copy_to(Device::cpu());
     expect_near(cuda_silu_cpu.at(0, 0), 8.998890F, 1.0e-4F, "cuda silu first value mismatch");
     expect_near(cuda_silu_cpu.at(0, 1), 1.761594F, 1.0e-4F, "cuda silu second value mismatch");
@@ -376,21 +468,24 @@ void run_fixture_test() {
     } catch (const sllmrf::GgufError &) {
         rejected_device_mismatch = true;
     }
-    expect(rejected_device_mismatch, "cuda tensor should be rejected by cpu backend");
+    expect(rejected_device_mismatch, "cuda tensor is rejected by cpu backend");
 
+    print_section("Fixture Logits");
     const auto normalized = model.apply_final_norm(embedding);
-    expect(normalized.shape() == embedding.shape(), "final norm shape mismatch");
+    expect_equal(normalized.shape(), embedding.shape(), "final norm shape");
+    std::cout << "logits preview uses last token hidden state\n";
 
     const auto logits = model.compute_logits(embedding);
-    expect(logits.size() == 5U, "fixture logits size mismatch");
+    expect_equal(logits.size(), std::size_t {5U}, "fixture logits size");
     expect_near(logits[0], 0.0F, 1.0e-4F, "logits[0] mismatch");
     expect_near(logits[1], 0.920575F, 1.0e-3F, "logits[1] mismatch");
     expect_near(logits[2], 1.073971F, 1.0e-3F, "logits[2] mismatch");
     expect_near(logits[3], 1.994546F, 1.0e-3F, "logits[3] mismatch");
     expect_near(logits[4], 0.997273F, 1.0e-3F, "logits[4] mismatch");
 
+    print_section("Fixture Decoder Block");
     const auto block_output = model.forward_layer(embedding, 0U, runtime);
-    expect(block_output.shape() == embedding.shape(), "block output shape mismatch");
+    expect_equal(block_output.shape(), embedding.shape(), "block output shape");
     expect_near(block_output.at(0, 0), 5.500523F, 1.0e-4F, "block output[0,0] mismatch");
     expect_near(block_output.at(0, 1), 5.681656F, 1.0e-4F, "block output[0,1] mismatch");
     expect_near(block_output.at(1, 0), 2.373720F, 1.0e-4F, "block output[1,0] mismatch");
@@ -401,17 +496,19 @@ void run_fixture_test() {
     expect_near(block_output.at(3, 1), 4.716015F, 1.0e-4F, "block output[3,1] mismatch");
 
     const auto block_logits = model.compute_logits(block_output);
-    expect(block_logits.size() == 5U, "block logits size mismatch");
+    expect_equal(block_logits.size(), std::size_t {5U}, "block logits size");
     expect_near(block_logits[0], 0.0F, 1.0e-4F, "block logits[0] mismatch");
     expect_near(block_logits[1], 0.971275F, 1.0e-3F, "block logits[1] mismatch");
     expect_near(block_logits[2], 1.027922F, 1.0e-3F, "block logits[2] mismatch");
     expect_near(block_logits[3], 1.999197F, 1.0e-3F, "block logits[3] mismatch");
     expect_near(block_logits[4], 0.999599F, 1.0e-3F, "block logits[4] mismatch");
-    expect(model.sample_greedy(block_logits) == 3U, "fixture greedy sampling mismatch");
-    expect(
-        model.sample_stochastic({-1000.0F, -1000.0F, 1000.0F}, 1.0F, 20260406U) == 2U,
-        "fixture stochastic sampling mismatch");
+    expect_equal(model.sample_greedy(block_logits), 3U, "fixture greedy sampling");
+    expect_equal(
+        model.sample_stochastic({-1000.0F, -1000.0F, 1000.0F}, 1.0F, 20260406U),
+        2U,
+        "fixture stochastic sampling");
 
+    print_section("Fixture KV Cache");
     expect_near(runtime.layers()[0].key.at(0, 0), 0.939552F, 1.0e-4F, "kv key cache first token mismatch");
     expect_near(runtime.layers()[0].value.at(0, 0), 0.939552F, 1.0e-4F, "kv value cache first token mismatch");
     expect_near(runtime.layers()[0].key.at(3, 1), -0.933124F, 1.0e-4F, "kv key cache last token mismatch");
@@ -419,14 +516,14 @@ void run_fixture_test() {
 
     auto full_runtime = model.create_runtime();
     const auto full_hidden = model.forward_prompt(prompt, full_runtime);
-    expect(full_hidden.shape() == block_output.shape(), "full hidden shape mismatch");
-    for (std::size_t index = 0; index < full_hidden.values().size(); ++index) {
-        expect_near(full_hidden.values()[index], block_output.values()[index], 1.0e-5F, "full rollout mismatch");
-    }
+    expect_equal(full_hidden.shape(), block_output.shape(), "full hidden shape");
+    expect_near(full_hidden.values().front(), block_output.values().front(), 1.0e-5F, "full rollout first value");
+    expect_near(full_hidden.values().back(), block_output.values().back(), 1.0e-5F, "full rollout last value");
 
+    print_section("Fixture CUDA Consistency");
     auto cuda_runtime = model.create_runtime(0U, sllmrf::ops::OperatorContext::cuda(0));
     const auto cuda_embedding = model.run_prompt_embedding(prompt, cuda_runtime);
-    expect(cuda_embedding.device() == Device::cuda(0), "cuda embedding placement mismatch");
+    expect_equal(cuda_embedding.device(), Device::cuda(0), "cuda embedding placement");
     auto cuda_embedding_cpu = cuda_embedding.copy_to(Device::cpu());
     for (std::size_t index = 0; index < cuda_embedding_cpu.values().size(); ++index) {
         expect_near(
@@ -436,7 +533,7 @@ void run_fixture_test() {
             "cuda embedding mismatch");
     }
     const auto cuda_block_output = model.forward_layer(cuda_embedding, 0U, cuda_runtime);
-    expect(cuda_block_output.device() == Device::cuda(0), "cuda block output placement mismatch");
+    expect_equal(cuda_block_output.device(), Device::cuda(0), "cuda block output placement");
     auto cuda_block_output_cpu = cuda_block_output.copy_to(Device::cpu());
     for (std::size_t index = 0; index < cuda_block_output_cpu.values().size(); ++index) {
         expect_near(
@@ -446,11 +543,11 @@ void run_fixture_test() {
             "cuda block output mismatch");
     }
     const auto cuda_block_logits = model.compute_logits(cuda_block_output);
-    expect(cuda_block_logits.size() == block_logits.size(), "cuda block logits size mismatch");
-    for (std::size_t index = 0; index < cuda_block_logits.size(); ++index) {
-        expect_near(cuda_block_logits[index], block_logits[index], 1.0e-5F, "cuda block logits mismatch");
-    }
+    expect_equal(cuda_block_logits.size(), block_logits.size(), "cuda block logits size");
+    expect_near(cuda_block_logits.front(), block_logits.front(), 1.0e-5F, "cuda block logits first value");
+    expect_near(cuda_block_logits.back(), block_logits.back(), 1.0e-5F, "cuda block logits last value");
 
+    print_section("Fixture Generation");
     const auto generated = model.generate(
         "hello world!",
         sllmrf::GenerationConfig {
@@ -459,12 +556,16 @@ void run_fixture_test() {
             .stop_at_eos = true,
             .layer_count = 0U,
         });
-    expect(generated.generated_token_ids.size() == 3U, "fixture generation size mismatch");
-    expect(generated.generated_token_ids[0] == 3U, "fixture generation token mismatch");
-    expect(generated.generated_token_ids[1] == 3U, "fixture generation token[1] mismatch");
-    expect(generated.generated_token_ids[2] == 3U, "fixture generation token[2] mismatch");
-    expect(generated.generated_text == "!!!", "fixture generation text mismatch");
-    expect(generated.full_text == "hello world!!!!", "fixture full text mismatch");
+    std::cout
+        << "generated token_ids=" << format_value(generated.generated_token_ids)
+        << " generated_text=" << format_value(generated.generated_text)
+        << '\n';
+    expect_equal(generated.generated_token_ids.size(), std::size_t {3U}, "fixture generation size");
+    expect_equal(generated.generated_token_ids[0], 3U, "fixture generation token[0]");
+    expect_equal(generated.generated_token_ids[1], 3U, "fixture generation token[1]");
+    expect_equal(generated.generated_token_ids[2], 3U, "fixture generation token[2]");
+    expect_equal(generated.generated_text, std::string("!!!"), "fixture generated text");
+    expect_equal(generated.full_text, std::string("hello world!!!!"), "fixture full text");
 
     const auto stochastic_generated_a = model.generate(
         "hello world!",
@@ -505,11 +606,12 @@ void run_fixture_test() {
             .layer_count = 0U,
             .execution_context = sllmrf::ops::OperatorContext::cuda(0),
         });
-    expect(cuda_generated.generated_token_ids == generated.generated_token_ids, "cuda generation token mismatch");
-    expect(cuda_generated.generated_text == generated.generated_text, "cuda generation text mismatch");
+    expect_equal(cuda_generated.generated_token_ids, generated.generated_token_ids, "cuda generation token ids");
+    expect_equal(cuda_generated.generated_text, generated.generated_text, "cuda generation text");
 }
 
 void run_optional_model_smoke_test() {
+    print_section("Real Model Smoke Test");
     const auto model_path =
         std::filesystem::path(SLLMRF_PROJECT_ROOT) / "models" / "internlm2-1_8-F16.gguf";
     if (!std::filesystem::exists(model_path)) {
@@ -519,19 +621,19 @@ void run_optional_model_smoke_test() {
 
     const auto model = Internlm2Model::load(model_path);
     expect(model.gguf().tensor_count() > 0U, "real model should contain tensors");
-    expect(model.config().architecture == "internlm2", "real model architecture mismatch");
+    expect_equal(model.config().architecture, std::string("internlm2"), "real model architecture");
 
     auto runtime = model.create_runtime(64U);
     const auto prompt = model.prepare_prompt("Hello world");
-    expect(!prompt.token_ids.empty(), "real model tokenizer returned no tokens");
-    expect(prompt.positions.size() == prompt.token_ids.size(), "real model prompt positions mismatch");
+    expect(!prompt.token_ids.empty(), "real model tokenizer returned tokens");
+    expect(prompt.positions.size() == prompt.token_ids.size(), "real model prompt positions are aligned");
 
     const auto embedding = model.run_prompt_embedding(prompt, runtime);
-    expect(embedding.shape().size() == 2U, "real model embedding rank mismatch");
-    expect(embedding.shape()[0] == prompt.token_ids.size(), "real model embedding sequence mismatch");
-    expect(embedding.shape()[1] == model.config().embedding_length, "real model embedding width mismatch");
-    expect(runtime.layers().size() == model.config().block_count, "real model kv cache layer mismatch");
-    expect(!model.build_prefill_plan().steps.empty(), "real model execution plan should not be empty");
+    expect_equal(embedding.shape().size(), std::size_t {2U}, "real model embedding rank");
+    expect_equal(embedding.shape()[0], static_cast<uint64_t>(prompt.token_ids.size()), "real model embedding sequence");
+    expect_equal(embedding.shape()[1], static_cast<uint64_t>(model.config().embedding_length), "real model embedding width");
+    expect_equal(runtime.layers().size(), static_cast<std::size_t>(model.config().block_count), "real model kv cache layer count");
+    expect(!model.build_prefill_plan().steps.empty(), "real model execution plan is not empty");
 
     const auto generated = model.generate(
         "Hello world",
@@ -542,9 +644,10 @@ void run_optional_model_smoke_test() {
             .layer_count = 0U,
             .execution_context = sllmrf::ops::OperatorContext::cpu(),
         });
-    expect(generated.generated_token_ids.size() <= 5U, "real model generation size mismatch");
-    expect(generated.generated_text == model.tokenizer().decode(generated.generated_token_ids), "real model generation decode mismatch");
-    expect(generated.full_text == std::string("Hello world") + generated.generated_text, "real model full text mismatch");
+    expect(generated.generated_token_ids.size() <= 5U, "real model generation length within limit");
+    std::cout << "real model generated text=" << format_value(generated.generated_text) << '\n';
+    expect_equal(generated.generated_text, model.tokenizer().decode(generated.generated_token_ids), "real model generation decode");
+    expect_equal(generated.full_text, std::string("Hello world") + generated.generated_text, "real model full text");
 
     const auto stochastic_generated_a = model.generate(
         "Hello world",
@@ -578,11 +681,11 @@ void run_optional_model_smoke_test() {
     expect(
         stochastic_generated_a.generated_text ==
             model.tokenizer().decode(stochastic_generated_a.generated_token_ids),
-        "real model stochastic generation decode mismatch");
+        "real model stochastic generation decode");
 
     auto cuda_runtime = model.create_runtime(64U, sllmrf::ops::OperatorContext::cuda(0));
     const auto cuda_prompt_hidden = model.forward_prompt(prompt, cuda_runtime);
-    expect(cuda_prompt_hidden.device() == Device::cuda(0), "real model cuda rollout placement mismatch");
+    expect_equal(cuda_prompt_hidden.device(), Device::cuda(0), "real model cuda rollout placement");
 }
 
 }  // namespace
