@@ -1,0 +1,3 @@
+[submodule "docs/graduation_thesis"]
+	path = docs/graduation_thesis
+	url = https://github.com/JBFYS-XD/graduation_thesis.git
