@@ -1,5 +1,7 @@
 #include "sllmrf/gguf.h"
 
+#include "mermaid.h"
+
 #include <algorithm>
 #include <bit>
 #include <cstring>
@@ -15,6 +17,45 @@
 #include <unistd.h>
 
 namespace sllmrf {
+
+namespace mermaid {
+
+std::string gguf_loading_module(
+    std::string_view graph_name,
+    std::string_view module_input,
+    std::string_view module_output) {
+    std::ostringstream stream;
+    stream << "%% " << escape(graph_name) << "\n";
+    stream << "flowchart TD\n";
+    stream << "    module_input([\"input: " << escape(module_input) << "\"])\n";
+    stream << "    module_output([\"output: " << escape(module_output) << "\"])\n";
+    stream << "    gguf_file[(GGUF file)]\n";
+    stream << "    mmap[\"mmap file data\"]\n";
+    stream << "    header[\"header<br/>magic, version, counts, alignment\"]\n";
+    stream << "    metadata[\"metadata entries<br/>general.*, internlm2.*, tokenizer.*\"]\n";
+    stream << "    tensor_infos[\"tensor infos<br/>names, dimensions, type, offset\"]\n";
+    stream << "    reader[\"GgufTensorReader<br/>named tensor and row access\"]\n";
+    stream << "    tokenizer_data([tokenizer metadata])\n";
+    stream << "    config_data([Internlm2Config fields])\n";
+    stream << "    weight_access([weight access for later modules])\n";
+    stream << "    module_input --> gguf_file --> mmap --> header\n";
+    stream << "    mmap --> metadata\n";
+    stream << "    mmap --> tensor_infos\n";
+    stream << "    metadata --> tokenizer_data\n";
+    stream << "    metadata --> config_data\n";
+    stream << "    tensor_infos --> reader\n";
+    stream << "    mmap --> reader --> weight_access\n";
+    stream << "    tokenizer_data --> module_output\n";
+    stream << "    config_data --> module_output\n";
+    stream << "    weight_access --> module_output\n";
+    write_class_defs(stream);
+    stream << "    class module_input,module_output,tokenizer_data,config_data,weight_access io\n";
+    stream << "    class gguf_file,mmap,tensor_infos,reader file\n";
+    stream << "    class header,metadata metadata\n";
+    return stream.str();
+}
+
+}  // namespace mermaid
 
 namespace {
 

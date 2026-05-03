@@ -210,10 +210,80 @@
 - greedy/stochastic 生成结果
 - generated text 与 full text
 - execution plan 展示
+- Mermaid 流程图、数据流图和模块图导出
 
 这部分非常适合直接作为毕业答辩中的“系统功能演示”。
 
-### 4.10 自动化测试与正确性验证
+### 4.10 Mermaid 推理图导出与可视化
+
+项目提供了面向推理过程理解的 Mermaid 图导出能力，可将模型运行链路写成 `.mmd` 描述文件，并通过 Mermaid CLI 渲染为 SVG。
+
+当前支持三类图：
+
+- 流程图：强调从 CLI 请求到模型加载、prompt 处理、runtime 创建、forward、采样和输出的执行顺序。
+- 数据流图：强调 GGUF metadata、Tokenizer、PromptBatch、TensorBuffer、KV Cache、logits、generated token ids 等数据对象如何流动。
+- 模块图：包含一张总模块图和多张模块细节图，用于展示项目的模块化边界。
+
+推荐导出命令如下：
+
+```bash
+./build/app/sllmrf_cli \
+  --model models/internlm2-1_8-F16.gguf \
+  --export-flow-graph build/compute_graphs/flow.mmd \
+  --export-dataflow-graph build/compute_graphs/dataflow.mmd \
+  --export-module-graphs build/compute_graphs/modules
+```
+
+生成结果包括：
+
+```text
+build/compute_graphs/flow.mmd
+build/compute_graphs/dataflow.mmd
+build/compute_graphs/modules/00-module-overview.mmd
+build/compute_graphs/modules/01-gguf-loading.mmd
+build/compute_graphs/modules/02-prompt-tokenizer.mmd
+build/compute_graphs/modules/03-runtime-tensor.mmd
+build/compute_graphs/modules/04-model-forward.mmd
+build/compute_graphs/modules/05-generation-output.mmd
+```
+
+这些文件名采用与具体模型解耦的命名方式，便于后续扩展到其他模型结构。
+
+流程图、数据流图、模块总览图和各模块细节图共享统一的关键阶段名称：
+
+```text
+01 GGUF Loading Module
+02 Prompt and Tokenizer Module
+03 Runtime and Tensor Module
+04 Model Forward Module
+05 Generation Output Module
+```
+
+每个模块细节图都包含 `module_input` 与 `module_output` 节点，其文本与总模块图中的 `input` / `output` 保持一致。例如：
+
+```text
+04 Model Forward Module
+input: PromptBatch + weights + runtime
+output: hidden state + logits
+```
+
+这样单独查看模块图时，也能和总模块图、流程图、数据流图中的关键阶段对应起来。
+
+将 `.mmd` 渲染为 SVG 可使用：
+
+```bash
+tools/render-mermaid-svg.sh build/compute_graphs
+```
+
+SVG 默认输出到：
+
+```text
+build/compute_graphs_svg/
+```
+
+该设计避免 Mermaid 描述文件与渲染产物混在同一目录中。脚本依赖 Mermaid CLI 的 `mmdc`，并使用 `tools/mermaid-puppeteer.json` 配置 Chromium 启动参数。
+
+### 4.11 自动化测试与正确性验证
 
 项目已具备自动化测试能力，覆盖了以下方面：
 

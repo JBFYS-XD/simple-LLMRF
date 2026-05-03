@@ -2,6 +2,7 @@ set(SLLMRF_LIBRARY_SOURCES
     device.cpp
     gguf.cpp
     internlm2.cpp
+    mermaid.cpp
     operators.cpp
     tensor.cpp
     tokenizer.cpp

@@ -84,6 +84,16 @@ struct Internlm2ExecutionPlan {
     std::vector<Internlm2PlanStep> steps;
 
     [[nodiscard]] std::string describe() const;
+    [[nodiscard]] std::string to_flow_mermaid(
+        std::string_view graph_name = "simple-LLMRF runtime flow graph") const;
+    [[nodiscard]] std::string to_mermaid(
+        std::string_view graph_name = "simple-LLMRF runtime flow graph") const;
+};
+
+struct MermaidGraphDocument {
+    std::string file_name;
+    std::string description;
+    std::string content;
 };
 
 enum class SamplingStrategy {
@@ -160,6 +170,9 @@ public:
         Internlm2Runtime &runtime) const;
     [[nodiscard]] Internlm2ExecutionPlan build_prefill_plan() const;
     [[nodiscard]] std::string describe_pipeline() const;
+    [[nodiscard]] std::string to_dataflow_mermaid(
+        std::string_view graph_name = "simple-LLMRF runtime dataflow graph") const;
+    [[nodiscard]] std::vector<MermaidGraphDocument> build_module_graphs() const;
     [[nodiscard]] TensorBuffer apply_final_norm(
         const TensorBuffer &hidden_state,
         ops::OperatorContext context = ops::OperatorContext::cpu()) const;

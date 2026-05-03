@@ -194,6 +194,70 @@ OMP_NUM_THREADS="$(getconf _NPROCESSORS_ONLN)" ctest --test-dir build --output-o
   --embedding-preview 12
 ```
 
+## Mermaid 推理图导出
+
+CLI 可以把当前模型的推理过程导出为 Mermaid `.mmd` 描述文件，方便生成 SVG 图用于阅读、调试或展示。
+
+推荐使用与模型无关的通用文件名：
+
+```bash
+./build/app/sllmrf_cli \
+  --model models/internlm2-1_8-F16.gguf \
+  --export-flow-graph build/compute_graphs/flow.mmd \
+  --export-dataflow-graph build/compute_graphs/dataflow.mmd \
+  --export-module-graphs build/compute_graphs/modules
+```
+
+会生成：
+
+```text
+build/compute_graphs/flow.mmd
+build/compute_graphs/dataflow.mmd
+build/compute_graphs/modules/00-module-overview.mmd
+build/compute_graphs/modules/01-gguf-loading.mmd
+build/compute_graphs/modules/02-prompt-tokenizer.mmd
+build/compute_graphs/modules/03-runtime-tensor.mmd
+build/compute_graphs/modules/04-model-forward.mmd
+build/compute_graphs/modules/05-generation-output.mmd
+```
+
+其中：
+
+- `flow.mmd` 面向快速理解执行流程和原型验证。
+- `dataflow.mmd` 面向推理框架初学者，强调数据对象如何流动。
+- `modules/*.mmd` 是每个模块的细节图。
+- `modules/00-module-overview.mmd` 是总模块图。
+
+流程图、数据流图、模块总览图和各模块细节图共享同一套关键阶段名称与模块边界。各模块细节图都包含统一的 `module_input` 与 `module_output` 节点，其文本与总模块图中的 `input` / `output` 对应。
+
+将 `.mmd` 渲染成 SVG：
+
+```bash
+tools/render-mermaid-svg.sh build/compute_graphs
+```
+
+也可以只渲染流程图和数据流图：
+
+```bash
+tools/render-mermaid-svg.sh \
+  build/compute_graphs/flow.mmd \
+  build/compute_graphs/dataflow.mmd
+```
+
+SVG 默认输出到独立目录，避免和 `.mmd` 混在一起：
+
+```text
+build/compute_graphs_svg/
+```
+
+可通过 `-o` 指定其他 SVG 输出目录：
+
+```bash
+tools/render-mermaid-svg.sh -o build/my_graph_svgs build/compute_graphs
+```
+
+脚本依赖 Mermaid CLI 的 `mmdc`，并默认使用 `tools/mermaid-puppeteer.json` 处理 root / Chromium 沙盒参数。
+
 ## CLI 功能
 
 CLI 当前支持以下信息展示：
@@ -208,6 +272,7 @@ CLI 当前支持以下信息展示：
 - logits preview
 - greedy / stochastic 生成结果
 - `generated text` 与 `full text`
+- Mermaid 流程图、数据流图和模块图导出
 
 可通过 `--help` 查看参数：
 

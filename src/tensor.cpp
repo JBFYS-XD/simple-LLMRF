@@ -1,11 +1,57 @@
 #include "sllmrf/tensor.h"
 
+#include "mermaid.h"
+
 #include <algorithm>
 #include <numeric>
 #include <sstream>
 #include <stdexcept>
 
 namespace sllmrf {
+
+namespace mermaid {
+
+std::string runtime_tensor_module(
+    std::string_view graph_name,
+    std::string_view module_input,
+    std::string_view module_output,
+    uint32_t block_count,
+    uint32_t embedding_length,
+    uint32_t attention_head_count_kv,
+    uint32_t head_dimension) {
+    std::ostringstream stream;
+    stream << "%% " << escape(graph_name) << "\n";
+    stream << "flowchart TD\n";
+    stream << "    module_input([\"input: " << escape(module_input) << "\"])\n";
+    stream << "    module_output([\"output: " << escape(module_output) << "\"])\n";
+    stream << "    config_in([Internlm2Config<br/>layers: " << block_count
+           << ", hidden: " << embedding_length << "])\n";
+    stream << "    device_options([device options<br/>cpu or cuda:n])\n";
+    stream << "    operator_context[\"OperatorContext<br/>execution device\"]\n";
+    stream << "    tensor_buffer[\"TensorBuffer<br/>shape + host values + device allocation\"]\n";
+    stream << "    runtime[\"Internlm2Runtime<br/>max_sequence_length + consumed_tokens\"]\n";
+    stream << "    kv_cache[\"KV cache<br/>layers x max_seq x kv_heads x head_dim<br/>"
+           << block_count << " x max_seq x " << attention_head_count_kv << " x "
+           << head_dimension << "\"]\n";
+    stream << "    runtime_out([runtime state for forward module])\n";
+    stream << "    module_input --> config_in\n";
+    stream << "    module_input --> device_options\n";
+    stream << "    config_in --> runtime\n";
+    stream << "    device_options --> operator_context --> runtime\n";
+    stream << "    operator_context --> tensor_buffer\n";
+    stream << "    runtime --> kv_cache\n";
+    stream << "    runtime --> runtime_out\n";
+    stream << "    kv_cache --> runtime_out\n";
+    stream << "    tensor_buffer --> runtime_out\n";
+    stream << "    runtime_out --> module_output\n";
+    write_class_defs(stream);
+    stream << "    class module_input,module_output,config_in,device_options,runtime_out io\n";
+    stream << "    class operator_context,runtime,kv_cache runtime\n";
+    stream << "    class tensor_buffer tensor\n";
+    return stream.str();
+}
+
+}  // namespace mermaid
 
 TensorBuffer::TensorBuffer(std::vector<uint64_t> shape, float initial_value, Device device)
     : shape_(std::move(shape)),

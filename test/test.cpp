@@ -379,6 +379,26 @@ void run_fixture_test() {
     expect_equal(static_cast<int>(plan.steps.front().type), static_cast<int>(sllmrf::Internlm2OpType::Embedding), "first plan step type");
     expect_equal(static_cast<int>(plan.steps.back().type), static_cast<int>(sllmrf::Internlm2OpType::OutputProjection), "last plan step type");
     expect(plan.describe().find("layer_0.qkv_projection") != std::string::npos, "plan contains qkv projection");
+    const auto flow_mermaid = plan.to_flow_mermaid("fixture internlm2 runtime graph");
+    expect(flow_mermaid.find("flowchart TD") != std::string::npos, "flow mermaid contains graph declaration");
+    expect(flow_mermaid.find("Decoder Block x1") != std::string::npos, "flow mermaid compresses repeated decoder layers");
+    expect(flow_mermaid.find("Fast prototype extension points") != std::string::npos, "flow mermaid shows research extension points");
+    expect(flow_mermaid.find("layer_0.qkv_projection") == std::string::npos, "flow mermaid hides per-layer nodes");
+    expect_equal(plan.to_mermaid("fixture internlm2 runtime graph"), flow_mermaid, "legacy mermaid alias matches flow graph");
+
+    const auto dataflow_mermaid = model.to_dataflow_mermaid("fixture internlm2 dataflow graph");
+    expect(dataflow_mermaid.find("GGUF loading data") != std::string::npos, "dataflow mermaid contains GGUF loading");
+    expect(dataflow_mermaid.find("Tokenizer") != std::string::npos, "dataflow mermaid contains tokenizer");
+    expect(dataflow_mermaid.find("embedding TensorBuffer") != std::string::npos, "dataflow mermaid contains tensor buffer");
+    expect(dataflow_mermaid.find("Decoder Block x1") != std::string::npos, "dataflow mermaid contains model tensor path");
+    expect(dataflow_mermaid.find("KV Cache") != std::string::npos, "dataflow mermaid contains kv cache");
+    const auto module_graphs = model.build_module_graphs();
+    expect_equal(module_graphs.size(), std::size_t {6U}, "module graph count");
+    expect_equal(module_graphs[4].file_name, std::string {"04-model-forward.mmd"}, "module graph file names avoid model names");
+    expect(module_graphs[0].content.find("01 GGUF Loading Module") != std::string::npos, "overview graph contains GGUF module");
+    expect(module_graphs[0].content.find("PromptBatch token_ids + positions") != std::string::npos, "overview graph contains module I/O");
+    expect(module_graphs[3].content.find("TensorBuffer") != std::string::npos, "runtime module graph contains tensor buffer");
+    expect(module_graphs[4].content.find("Single decoder block template") != std::string::npos, "forward module graph contains block template");
 
     print_section("Fixture Operators");
     const TensorBuffer rms_input({1U, 2U}, {3.0F, 4.0F});

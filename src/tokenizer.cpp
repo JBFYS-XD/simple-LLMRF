@@ -1,5 +1,7 @@
 #include "sllmrf/tokenizer.h"
 
+#include "mermaid.h"
+
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -8,6 +10,46 @@
 #include <stdexcept>
 
 namespace sllmrf {
+
+namespace mermaid {
+
+std::string prompt_tokenizer_module(
+    std::string_view graph_name,
+    std::string_view module_input,
+    std::string_view module_output) {
+    std::ostringstream stream;
+    stream << "%% " << escape(graph_name) << "\n";
+    stream << "flowchart TD\n";
+    stream << "    module_input([\"input: " << escape(module_input) << "\"])\n";
+    stream << "    module_output([\"output: " << escape(module_output) << "\"])\n";
+    stream << "    prompt_text([prompt text])\n";
+    stream << "    tokenizer_data([tokenizer metadata from GGUF module])\n";
+    stream << "    tokenizer[\"Tokenizer<br/>vocab, scores, token types, special ids\"]\n";
+    stream << "    encode[\"encode(prompt)<br/>BOS/EOS handling + matching\"]\n";
+    stream << "    token_ids[\"token ids<br/>uint32 sequence\"]\n";
+    stream << "    positions[\"positions<br/>0..seq-1\"]\n";
+    stream << "    prompt_batch([PromptBatch])\n";
+    stream << "    decode_support([decode support for generated ids])\n";
+    stream << "    module_input --> prompt_text\n";
+    stream << "    module_input --> tokenizer_data\n";
+    stream << "    tokenizer_data --> tokenizer\n";
+    stream << "    prompt_text --> encode\n";
+    stream << "    tokenizer --> encode --> token_ids\n";
+    stream << "    token_ids --> positions\n";
+    stream << "    token_ids --> prompt_batch\n";
+    stream << "    positions --> prompt_batch\n";
+    stream << "    tokenizer --> decode_support\n";
+    stream << "    prompt_batch --> module_output\n";
+    stream << "    decode_support --> module_output\n";
+    write_class_defs(stream);
+    stream << "    class module_input,module_output,prompt_text,prompt_batch,decode_support io\n";
+    stream << "    class tokenizer_data metadata\n";
+    stream << "    class tokenizer,encode group\n";
+    stream << "    class token_ids,positions tensor\n";
+    return stream.str();
+}
+
+}  // namespace mermaid
 
 namespace {
 

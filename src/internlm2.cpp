@@ -1,5 +1,7 @@
 #include "sllmrf/internlm2.h"
 
+#include "mermaid.h"
+
 #include <algorithm>
 #include <bit>
 #include <cstdint>
@@ -145,6 +147,269 @@ uint32_t sample_stochastic_impl(
 
     std::discrete_distribution<std::size_t> distribution(weights.begin(), weights.end());
     return static_cast<uint32_t>(distribution(rng));
+}
+
+struct GraphModuleSpec {
+    std::string id;
+    std::string title;
+    std::string file_name;
+    std::string description;
+    std::string class_name;
+    std::string input;
+    std::string output;
+    std::string flow_detail;
+    std::string data_detail;
+};
+
+struct GraphModuleConnection {
+    std::string from;
+    std::string to;
+    std::string data_label;
+};
+
+struct GraphModuleSet {
+    std::vector<GraphModuleSpec> modules;
+    std::vector<GraphModuleConnection> connections;
+};
+
+GraphModuleSet build_graph_module_specs(
+    uint32_t block_count,
+    uint32_t embedding_length,
+    uint32_t context_length,
+    std::size_t vocab_size) {
+    GraphModuleSet specs;
+    specs.modules = {
+        {
+            .id = "gguf",
+            .title = "01 GGUF Loading Module",
+            .file_name = "01-gguf-loading.mmd",
+            .description = "GGUF loading module graph",
+            .class_name = "file",
+            .input = "model path",
+            .output = "metadata, tokenizer metadata, config, tensor reader",
+            .flow_detail = "load GGUF file and expose model objects",
+            .data_detail = "metadata + tensor infos + F16/F32 weights",
+        },
+        {
+            .id = "prompt",
+            .title = "02 Prompt and Tokenizer Module",
+            .file_name = "02-prompt-tokenizer.mmd",
+            .description = "prompt and tokenizer module graph",
+            .class_name = "group",
+            .input = "prompt text + tokenizer metadata",
+            .output = "PromptBatch token_ids + positions, decode support",
+            .flow_detail = "encode prompt and prepare positions",
+            .data_detail = "prompt text -> token ids -> PromptBatch",
+        },
+        {
+            .id = "runtime",
+            .title = "03 Runtime and Tensor Module",
+            .file_name = "03-runtime-tensor.mmd",
+            .description = "runtime and tensor module graph",
+            .class_name = "runtime",
+            .input = "config + device options",
+            .output = "OperatorContext, KV cache, TensorBuffer placement",
+            .flow_detail = "select device and allocate runtime state",
+            .data_detail = "runtime state + KV Cache",
+        },
+        {
+            .id = "forward",
+            .title = "04 Model Forward Module",
+            .file_name = "04-model-forward.mmd",
+            .description = "model forward module graph",
+            .class_name = "attention",
+            .input = "PromptBatch + weights + runtime",
+            .output = "hidden state + logits",
+            .flow_detail = "embedding -> Decoder Block x" + std::to_string(block_count) + " -> final norm -> LM head",
+            .data_detail = "embedding TensorBuffer [seq, " + std::to_string(embedding_length) +
+                "] -> Decoder Block x" + std::to_string(block_count) +
+                " -> logits [vocab: " + std::to_string(vocab_size) + "]",
+        },
+        {
+            .id = "generation",
+            .title = "05 Generation Output Module",
+            .file_name = "05-generation-output.mmd",
+            .description = "generation output module graph",
+            .class_name = "activation",
+            .input = "logits + tokenizer decode support",
+            .output = "generated ids and text",
+            .flow_detail = "sample next token and decode output",
+            .data_detail = "logits -> sampled token ids -> generated text",
+        },
+    };
+    specs.connections = {
+        {.from = "gguf", .to = "prompt", .data_label = "Tokenizer"},
+        {.from = "gguf", .to = "runtime", .data_label = "Internlm2Config"},
+        {.from = "gguf", .to = "forward", .data_label = "GgufTensorReader + TensorLayout"},
+        {.from = "prompt", .to = "forward", .data_label = "PromptBatch token_ids + positions"},
+        {.from = "runtime", .to = "forward", .data_label = "OperatorContext + KV Cache"},
+        {.from = "forward", .to = "generation", .data_label = "logits"},
+        {.from = "prompt", .to = "generation", .data_label = "decode support"},
+    };
+    (void)context_length;
+    return specs;
+}
+
+GraphModuleSet build_graph_module_specs_from_plan(
+    const std::vector<Internlm2PlanStep> &steps) {
+    std::size_t decoder_start = steps.size();
+    std::size_t decoder_end = steps.size();
+    for (std::size_t index = 0; index < steps.size(); ++index) {
+        if (steps[index].name.rfind("layer_", 0) == 0U) {
+            decoder_start = std::min(decoder_start, index);
+            decoder_end = index + 1U;
+        }
+    }
+
+    const auto decoder_step_count = decoder_end > decoder_start ? decoder_end - decoder_start : 0U;
+    const auto layer_count = static_cast<uint32_t>(decoder_step_count / 11U);
+    return build_graph_module_specs(layer_count, 0U, 0U, 0U);
+}
+
+std::string module_node_label(const GraphModuleSpec &module) {
+    return mermaid::escape(module.title) + "<br/>input: " +
+        mermaid::escape(module.input) + "<br/>output: " +
+        mermaid::escape(module.output);
+}
+
+std::string module_detail_node_id(
+    std::string_view module_id,
+    std::string_view suffix) {
+    return mermaid::compact_node_id(std::string(module_id) + "_" + std::string(suffix));
+}
+
+const GraphModuleSpec *find_module_spec(
+    const GraphModuleSet &specs,
+    std::string_view id) {
+    for (const auto &module : specs.modules) {
+        if (module.id == id) {
+            return &module;
+        }
+    }
+    return nullptr;
+}
+
+std::string module_overview_mermaid(
+    std::string_view graph_name,
+    const GraphModuleSet &specs) {
+    std::ostringstream stream;
+    stream << "%% " << mermaid::escape(graph_name) << "\n";
+    stream << "flowchart TD\n";
+    stream << "    model_path([model path])\n";
+    stream << "    prompt_text([prompt text])\n";
+    stream << "    device_options([device and generation options])\n";
+    stream << "    generated_text([generated text and debug previews])\n";
+    for (const auto &module : specs.modules) {
+        stream << "    " << module.id << "[\"" << module_node_label(module) << "\"]\n";
+    }
+    stream << "    model_path --> gguf\n";
+    stream << "    prompt_text --> prompt\n";
+    stream << "    device_options --> runtime\n";
+    for (const auto &connection : specs.connections) {
+        stream << "    " << connection.from << " -->|" << mermaid::escape(connection.data_label)
+               << "| " << connection.to << "\n";
+    }
+    stream << "    generation --> generated_text\n";
+    mermaid::write_class_defs(stream);
+    stream << "    class model_path,prompt_text,device_options,generated_text io\n";
+    for (const auto &module : specs.modules) {
+        stream << "    class " << module.id << " " << module.class_name << "\n";
+    }
+    return stream.str();
+}
+
+std::string forward_module_mermaid(
+    std::string_view graph_name,
+    std::string_view module_input,
+    std::string_view module_output,
+    const Internlm2Config &config) {
+    std::ostringstream stream;
+    stream << "%% " << mermaid::escape(graph_name) << "\n";
+    stream << "flowchart TD\n";
+    stream << "    module_input([\"input: " << mermaid::escape(module_input) << "\"])\n";
+    stream << "    module_output([\"output: " << mermaid::escape(module_output) << "\"])\n";
+    stream << "    prompt_batch([PromptBatch])\n";
+    stream << "    weight_access([GgufTensorReader + TensorLayout])\n";
+    stream << "    runtime_state([runtime + KV cache])\n";
+    stream << "    embedding[\"Token Embedding<br/>token ids -> TensorBuffer [seq, "
+           << config.embedding_length << "]\"]\n";
+    stream << "    decoder[\"Decoder Block x" << config.block_count
+           << "<br/>same block template repeated\"]\n";
+    stream << "    final_norm[\"Final RMSNorm\"]\n";
+    stream << "    lm_head[\"LM Head<br/>last hidden state -> logits\"]\n";
+    stream << "    logits([logits for generation module])\n";
+    stream << "    subgraph block_template[Single decoder block template]\n";
+    stream << "        direction LR\n";
+    stream << "        attn_norm[\"attn_norm\"]\n";
+    stream << "        qkv[\"q/k/v projection\"]\n";
+    stream << "        rope[\"RoPE\"]\n";
+    stream << "        kv[\"KV cache write/read\"]\n";
+    stream << "        attention[\"causal attention\"]\n";
+    stream << "        attn_residual[\"attention residual\"]\n";
+    stream << "        ffn_norm[\"ffn_norm\"]\n";
+    stream << "        gate_up[\"gate/up projection\"]\n";
+    stream << "        swiglu[\"SwiGLU\"]\n";
+    stream << "        ffn_down[\"ffn down projection\"]\n";
+    stream << "        ffn_residual[\"ffn residual\"]\n";
+    stream << "        attn_norm --> qkv --> rope --> attention --> attn_residual --> ffn_norm --> gate_up --> swiglu --> ffn_down --> ffn_residual\n";
+    stream << "        rope --> kv --> attention\n";
+    stream << "    end\n";
+    stream << "    module_input --> prompt_batch\n";
+    stream << "    module_input --> weight_access\n";
+    stream << "    module_input --> runtime_state\n";
+    stream << "    prompt_batch --> embedding --> decoder --> final_norm --> lm_head --> logits\n";
+    stream << "    weight_access --> embedding\n";
+    stream << "    weight_access --> decoder\n";
+    stream << "    weight_access --> final_norm\n";
+    stream << "    weight_access --> lm_head\n";
+    stream << "    runtime_state --> decoder\n";
+    stream << "    decoder -. repeated structure .-> block_template\n";
+    stream << "    logits --> module_output\n";
+    mermaid::write_class_defs(stream);
+    stream << "    class module_input,module_output,prompt_batch,weight_access,runtime_state,logits io\n";
+    stream << "    class embedding embedding\n";
+    stream << "    class decoder,attention,kv,block_template attention\n";
+    stream << "    class final_norm,attn_norm,ffn_norm norm\n";
+    stream << "    class lm_head,qkv,gate_up,ffn_down linear\n";
+    stream << "    class attn_residual,ffn_residual residual\n";
+    stream << "    class swiglu activation\n";
+    return stream.str();
+}
+
+std::string generation_module_mermaid(
+    std::string_view graph_name,
+    std::string_view module_input,
+    std::string_view module_output) {
+    std::ostringstream stream;
+    stream << "%% " << mermaid::escape(graph_name) << "\n";
+    stream << "flowchart TD\n";
+    stream << "    module_input([\"input: " << mermaid::escape(module_input) << "\"])\n";
+    stream << "    module_output([\"output: " << mermaid::escape(module_output) << "\"])\n";
+    stream << "    logits([logits from forward module])\n";
+    stream << "    config[\"GenerationConfig<br/>max_new_tokens, sampling, temperature, seed\"]\n";
+    stream << "    greedy[\"greedy sampling\"]\n";
+    stream << "    stochastic[\"stochastic sampling\"]\n";
+    stream << "    next_token[\"next token id\"]\n";
+    stream << "    autoregressive[\"append token and continue<br/>until max_new_tokens or EOS\"]\n";
+    stream << "    generated_ids([generated token ids])\n";
+    stream << "    decode_support([Tokenizer decode support])\n";
+    stream << "    generated_text([generated text + full text])\n";
+    stream << "    module_input --> logits\n";
+    stream << "    module_input --> decode_support\n";
+    stream << "    logits --> greedy --> next_token\n";
+    stream << "    logits --> stochastic --> next_token\n";
+    stream << "    config --> greedy\n";
+    stream << "    config --> stochastic\n";
+    stream << "    next_token --> autoregressive --> generated_ids\n";
+    stream << "    generated_ids --> decode_support --> generated_text\n";
+    stream << "    generated_text --> module_output\n";
+    mermaid::write_class_defs(stream);
+    stream << "    class logits,next_token,generated_ids tensor\n";
+    stream << "    class config metadata\n";
+    stream << "    class greedy,stochastic,autoregressive activation\n";
+    stream << "    class decode_support group\n";
+    stream << "    class module_input,module_output,generated_text io\n";
+    return stream.str();
 }
 
 ops::OperatorContext context_for_device(Device device) {
@@ -699,6 +964,63 @@ std::string Internlm2ExecutionPlan::describe() const {
     return stream.str();
 }
 
+std::string Internlm2ExecutionPlan::to_flow_mermaid(
+    std::string_view graph_name) const {
+    std::ostringstream stream;
+    stream << "%% " << mermaid::escape(graph_name) << "\n";
+    stream << "flowchart TD\n";
+    stream << "    start([CLI request])\n";
+    stream << "    output([generated text and debug previews])\n";
+
+    if (steps.empty()) {
+        stream << "    start --> output\n";
+        return stream.str();
+    }
+
+    const auto specs = build_graph_module_specs_from_plan(steps);
+    stream << "    cli[\""
+           << mermaid::node_label("Parse CLI Options", "model path, prompt, device, generation flags") << "\"]\n";
+    for (const auto &module : specs.modules) {
+        stream << "    " << module.id << "[\""
+               << module_node_label(module) << "\"]\n";
+        stream << "    " << module_detail_node_id(module.id, "flow_detail")
+               << "[\"" << mermaid::node_label("flow detail", module.flow_detail) << "\"]\n";
+        stream << "    " << module.id << " -.-> "
+               << module_detail_node_id(module.id, "flow_detail") << "\n";
+    }
+    stream << "    start --> cli --> gguf --> prompt --> runtime --> forward --> generation --> output\n";
+    stream << "    gguf -. weights .-> forward\n";
+    stream << "    prompt -. decode support .-> generation\n";
+
+    stream << "    subgraph experiment_points[Fast prototype extension points]\n";
+    stream << "        direction LR\n";
+        stream << "        device_choice[\"Device path<br/>cpu / cuda:n\"]\n";
+    stream << "        one_block[\"Layer experiments<br/>--run-one-block / --layers\"]\n";
+        stream << "        sampler_choice[\"Sampling experiments<br/>greedy / stochastic / temperature / seed\"]\n";
+        stream << "        preview_choice[\"Inspection output<br/>embedding/logits previews\"]\n";
+    stream << "    end\n";
+    stream << "    cli -. configures .-> device_choice\n";
+    stream << "    forward -. inspect or limit .-> one_block\n";
+    stream << "    generation -. replace strategy .-> sampler_choice\n";
+    stream << "    output -. includes .-> preview_choice\n";
+
+    mermaid::write_class_defs(stream);
+    stream << "    class start,output io\n";
+    stream << "    class cli group\n";
+    for (const auto &module : specs.modules) {
+        stream << "    class " << module.id << " " << module.class_name << "\n";
+        stream << "    class " << module_detail_node_id(module.id, "flow_detail") << " group\n";
+    }
+    stream << "    class sampler_choice activation\n";
+    stream << "    class device_choice,one_block,preview_choice tensor\n";
+
+    return stream.str();
+}
+
+std::string Internlm2ExecutionPlan::to_mermaid(std::string_view graph_name) const {
+    return to_flow_mermaid(graph_name);
+}
+
 Internlm2Model Internlm2Model::load(const std::filesystem::path &path) {
     auto gguf = GgufFile::load(path);
     auto weights = GgufTensorReader::open(gguf);
@@ -923,6 +1245,139 @@ std::string Internlm2Model::describe_pipeline() const {
     stream << "implemented now: steps 1-7 with greedy/stochastic sampling, runtime/KV cache allocation, execution plan builder\n";
     stream << "reserved interfaces: top-k/top-p sampling and further performance optimization\n";
     return stream.str();
+}
+
+std::string Internlm2Model::to_dataflow_mermaid(std::string_view graph_name) const {
+    const auto specs = build_graph_module_specs(
+        config_.block_count,
+        config_.embedding_length,
+        config_.context_length,
+        tokenizer_.vocab_size());
+    std::ostringstream stream;
+    stream << "%% " << mermaid::escape(graph_name) << "\n";
+    stream << "flowchart TD\n";
+    stream << "    gguf_file[(GGUF model file)]\n";
+    stream << "    prompt_text([Prompt text])\n";
+    stream << "    device_options([Device and generation options])\n";
+    stream << "    output_text([Generated text])\n";
+    for (const auto &module : specs.modules) {
+        stream << "    " << module.id << "[\""
+               << module_node_label(module) << "\"]\n";
+        stream << "    " << module_detail_node_id(module.id, "data_detail")
+               << "[\"" << mermaid::node_label("data detail", module.data_detail) << "\"]\n";
+        stream << "    " << module.id << " -.-> "
+               << module_detail_node_id(module.id, "data_detail") << "\n";
+    }
+
+    stream << "    subgraph shared_data[Shared data interfaces from module specs]\n";
+    stream << "        metadata[\"GGUF loading data<br/>metadata + tensor infos + tensor data\"]\n";
+    stream << "        tokenizer[\"Tokenizer<br/>vocab size: " << tokenizer_.vocab_size() << "\"]\n";
+    stream << "        config[\"Internlm2Config<br/>layers: " << config_.block_count
+           << ", hidden: " << config_.embedding_length
+           << ", ctx: " << config_.context_length << "\"]\n";
+    stream << "        prompt_batch[\"PromptBatch<br/>token_ids + positions\"]\n";
+    stream << "        runtime_state[\"Runtime state<br/>OperatorContext + KV Cache\"]\n";
+    stream << "        embedding_tensor[\"embedding TensorBuffer<br/>[seq, " << config_.embedding_length << "]\"]\n";
+    stream << "        decoder_blocks[\"Decoder Block x" << config_.block_count
+           << "<br/>hidden_state transformed layer by layer\"]\n";
+    stream << "        logits[\"logits<br/>[vocab: " << tokenizer_.vocab_size() << "]\"]\n";
+    stream << "        sampled_ids[\"generated token ids\"]\n";
+    stream << "    end\n";
+
+    stream << "    gguf_file --> gguf\n";
+    stream << "    prompt_text --> prompt\n";
+    stream << "    device_options --> runtime\n";
+    for (const auto &connection : specs.connections) {
+        stream << "    " << connection.from << " -->|" << mermaid::escape(connection.data_label)
+               << "| " << connection.to << "\n";
+    }
+    stream << "    generation --> output_text\n";
+    stream << "    gguf --> metadata --> tokenizer\n";
+    stream << "    metadata --> config\n";
+    stream << "    tokenizer --> prompt --> prompt_batch\n";
+    stream << "    config --> runtime --> runtime_state\n";
+    stream << "    prompt_batch --> embedding_tensor --> decoder_blocks --> logits\n";
+    stream << "    runtime_state <--> decoder_blocks\n";
+    stream << "    logits --> sampled_ids --> generation\n";
+    stream << "    tokenizer --> generation\n";
+
+    mermaid::write_class_defs(stream);
+    stream << "    class gguf_file file\n";
+    stream << "    class prompt_text,device_options,output_text io\n";
+    for (const auto &module : specs.modules) {
+        stream << "    class " << module.id << " " << module.class_name << "\n";
+        stream << "    class " << module_detail_node_id(module.id, "data_detail") << " group\n";
+    }
+    stream << "    class metadata,config metadata\n";
+    stream << "    class tokenizer,prompt_batch group\n";
+    stream << "    class embedding_tensor,decoder_blocks,logits,sampled_ids tensor\n";
+    stream << "    class runtime_state runtime\n";
+    return stream.str();
+}
+
+std::vector<MermaidGraphDocument> Internlm2Model::build_module_graphs() const {
+    const auto specs = build_graph_module_specs(
+        config_.block_count,
+        config_.embedding_length,
+        config_.context_length,
+        tokenizer_.vocab_size());
+    const auto *gguf = find_module_spec(specs, "gguf");
+    const auto *prompt = find_module_spec(specs, "prompt");
+    const auto *runtime = find_module_spec(specs, "runtime");
+    const auto *forward = find_module_spec(specs, "forward");
+    const auto *generation = find_module_spec(specs, "generation");
+    return {
+        {
+            .file_name = "00-module-overview.mmd",
+            .description = "module overview graph",
+            .content = module_overview_mermaid("simple-LLMRF module overview: " + config_.model_name, specs),
+        },
+        {
+            .file_name = gguf == nullptr ? "01-gguf-loading.mmd" : gguf->file_name,
+            .description = gguf == nullptr ? "GGUF loading module graph" : gguf->description,
+            .content = mermaid::gguf_loading_module(
+                "simple-LLMRF GGUF loading module",
+                gguf == nullptr ? "model path" : gguf->input,
+                gguf == nullptr ? "metadata, tensor reader" : gguf->output),
+        },
+        {
+            .file_name = prompt == nullptr ? "02-prompt-tokenizer.mmd" : prompt->file_name,
+            .description = prompt == nullptr ? "prompt and tokenizer module graph" : prompt->description,
+            .content = mermaid::prompt_tokenizer_module(
+                "simple-LLMRF prompt and tokenizer module",
+                prompt == nullptr ? "prompt text + tokenizer" : prompt->input,
+                prompt == nullptr ? "PromptBatch" : prompt->output),
+        },
+        {
+            .file_name = runtime == nullptr ? "03-runtime-tensor.mmd" : runtime->file_name,
+            .description = runtime == nullptr ? "runtime and tensor module graph" : runtime->description,
+            .content = mermaid::runtime_tensor_module(
+                "simple-LLMRF runtime and tensor module",
+                runtime == nullptr ? "config + device options" : runtime->input,
+                runtime == nullptr ? "runtime, KV cache, TensorBuffer placement" : runtime->output,
+                config_.block_count,
+                config_.embedding_length,
+                config_.attention_head_count_kv,
+                config_.head_dimension()),
+        },
+        {
+            .file_name = forward == nullptr ? "04-model-forward.mmd" : forward->file_name,
+            .description = forward == nullptr ? "model forward module graph" : forward->description,
+            .content = forward_module_mermaid(
+                "simple-LLMRF InternLM2 forward module",
+                forward == nullptr ? "PromptBatch + weights + runtime" : forward->input,
+                forward == nullptr ? "hidden state + logits" : forward->output,
+                config_),
+        },
+        {
+            .file_name = generation == nullptr ? "05-generation-output.mmd" : generation->file_name,
+            .description = generation == nullptr ? "generation output module graph" : generation->description,
+            .content = generation_module_mermaid(
+                "simple-LLMRF generation output module",
+                generation == nullptr ? "logits + tokenizer" : generation->input,
+                generation == nullptr ? "generated ids and text" : generation->output),
+        },
+    };
 }
 
 TensorBuffer Internlm2Model::apply_final_norm(
